@@ -1,12 +1,8 @@
 #!/bin/bash
 
 # Print waring
-echo "This script should be ran on ubuntu hosts only. It will install nmap dig curl and ufw. Run this script with sudo or as root. Script starts in 10s..."
+echo "This script should be ran on ubuntu hosts only. Run this script with sudo or as root. Script starts in 10s..."
 sleep 10
-
-# Install deps
-echo "Installing deps"
-apt install nmap dig curl ufw -y
 
 
 # Function to check system resources
