@@ -146,6 +146,10 @@ if [ "$resolved_ip" != "$gateway_ip" ]; then
     print_color "$RED" "Error: DNS public IP mismatch. Please check your DNS configuration."
 fi
 
+# Get LAN IP of the host
+lan_ip=$(ip -4 addr show | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | grep -v '127.0.0.1' | head -n 1)
+echo "LAN IP: $lan_ip"
+
 # Get quantity of Evernode instances
 read -p "How many Evernode instances do you have? " instance_count
 
@@ -160,8 +164,8 @@ all_ports=("${user_ports[@]}" "${peer_ports[@]}" "${tcp_ports[@]}" "80")
 # Check ports of gateway
 check_ports "$domain_name" "$(IFS=,; echo "${all_ports[*]}")"
 
-# Check ports of host
-check_ports "localhost" "$(IFS=,; echo "${all_ports[*]}")"
+# Check ports of host (using LAN IP)
+check_ports "$lan_ip" "$(IFS=,; echo "${all_ports[*]}")"
 
 # Check UFW configuration
 check_ufw_config
@@ -179,8 +183,8 @@ check_system_resources
 
 print_color "$YELLOW" "Port Status Summary:"
 print_color "$YELLOW" "--------------------"
-print_color "$YELLOW" "Ensure all required ports are open or filtered on both your gateway and localhost."
+print_color "$YELLOW" "Ensure all required ports are open or filtered on both your gateway and LAN IP."
 print_color "$YELLOW" "Filtered ports may still be functional for Evernode, but consider investigating further."
 print_color "$YELLOW" "If any ports are closed, configure your firewall to open them."
 print_color "$YELLOW" "For the gateway, you may need to set up port forwarding on your router."
-print_color "$YELLOW" "For localhost, check your UFW configuration and other local firewall settings."
+print_color "$YELLOW" "For the LAN IP, check your UFW configuration and other local firewall settings."
