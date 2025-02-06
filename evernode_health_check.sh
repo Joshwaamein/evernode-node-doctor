@@ -13,17 +13,6 @@ print_color() {
     echo -e "${color}${message}${NC}"
 }
 
-# Get domain name
-read -p "Enter the domain name of your Evernode host: " domain_name
-resolved_ip=$(dig +short "$domain_name")
-echo "Resolved IP: $resolved_ip"
-
-# Check if script is run as root
-if [ "$EUID" -ne 0 ]; then
-    print_color "$RED" "Please run this script as root or with sudo."
-    exit 1
-fi
-
 # Function to install dependencies
 install_deps() {
     print_color "$YELLOW" "Installing dependencies..."
@@ -59,8 +48,51 @@ check_system_resources() {
     fi
 }
 
+# Function to check ports
+check_ports() {
+    local target=$1
+    local ports=$2
+    local open_ports=()
+    local closed_ports=()
+
+    print_color "$YELLOW" "Checking ports on $target..."
+    
+    while IFS= read -r line; do
+        if [[ $line =~ ([0-9]+)/tcp[[:space:]]+(open|closed) ]]; then
+            port="${BASH_REMATCH[1]}"
+            state="${BASH_REMATCH[2]}"
+            if [ "$state" == "open" ]; then
+                open_ports+=("$port")
+            else
+                closed_ports+=("$port")
+            fi
+        fi
+    done < <(nmap -p"$ports" "$target" | grep "/tcp")
+
+    if [ ${#open_ports[@]} -eq 0 ]; then
+        print_color "$RED" "No required ports are open on $target."
+    elif [ ${#open_ports[@]} -eq ${#all_ports[@]} ]; then
+        print_color "$GREEN" "All required ports are open on $target."
+    else
+        print_color "$YELLOW" "Some required ports are open on $target:"
+        echo "Open ports: ${open_ports[*]}"
+        echo "Closed ports: ${closed_ports[*]}"
+    fi
+}
+
+# Check if script is run as root
+if [ "$EUID" -ne 0 ]; then
+    print_color "$RED" "Please run this script as root or with sudo."
+    exit 1
+fi
+
 # Install dependencies
 install_deps
+
+# Get domain name
+read -p "Enter the domain name of your Evernode host: " domain_name
+resolved_ip=$(dig +short "$domain_name")
+echo "Resolved IP: $resolved_ip"
 
 # Get public IP of local gateway
 gateway_ip=$(curl -s https://ipinfo.io/ip)
@@ -79,15 +111,13 @@ peer_ports=($(seq 26201 $((26201 + instance_count))))
 tcp_ports=($(seq 36525 $((36525 + instance_count * 2 - 1))))
 udp_ports=($(seq 39064 $((39064 + instance_count * 2 - 1))))
 
-all_ports=("${user_ports[@]}" "${peer_ports[@]}" "${tcp_ports[@]}" "${udp_ports[@]}" "80")
+all_ports=("${user_ports[@]}" "${peer_ports[@]}" "${tcp_ports[@]}" "80")
 
 # Check ports of gateway
-print_color "$YELLOW" "Checking gateway ports..."
-nmap -p$(IFS=,; echo "${all_ports[*]}") $domain_name
+check_ports "$domain_name" "$(IFS=,; echo "${all_ports[*]}")"
 
 # Check ports of host
-print_color "$YELLOW" "Checking localhost ports..."
-nmap -p$(IFS=,; echo "${all_ports[*]}") localhost
+check_ports "localhost" "$(IFS=,; echo "${all_ports[*]}")"
 
 # Print UFW configuration
 print_color "$YELLOW" "UFW Configuration:"
@@ -107,3 +137,10 @@ fi
 
 # Check system resources
 check_system_resources
+
+print_color "$YELLOW" "Port Status Summary:"
+print_color "$YELLOW" "--------------------"
+print_color "$YELLOW" "Ensure all required ports are open on both your gateway and localhost."
+print_color "$YELLOW" "If any ports are closed, configure your firewall to open them."
+print_color "$YELLOW" "For the gateway, you may need to set up port forwarding on your router."
+print_color "$YELLOW" "For localhost, check your UFW configuration and other local firewall settings."
