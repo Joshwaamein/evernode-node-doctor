@@ -6,6 +6,11 @@ if [ "$EUID" -ne 0 ]; then
   exit 1
 fi
 
+# Get domain name
+read -p "Enter the domain name of your Evernode host: " domain_name
+resolved_ip=$(dig +short $domain_name)
+echo "Resolved IP: $resolved_ip"
+
 # Function to install dependencies
 install_deps() {
   echo "Installing dependencies..."
@@ -43,11 +48,6 @@ check_system_resources() {
 
 # Install dependencies
 install_deps
-
-# Get domain name
-read -p "Enter the domain name of your Evernode host: " domain_name
-resolved_ip=$(dig +short $domain_name)
-echo "Resolved IP: $resolved_ip"
 
 # Get public IP of local gateway
 gateway_ip=$(curl -s https://ipinfo.io/ip)
