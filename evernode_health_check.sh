@@ -53,6 +53,7 @@ check_ports() {
     local target=$1
     local ports=$2
     local open_ports=()
+    local filtered_ports=()
     local closed_ports=()
 
     print_color "$YELLOW" "Checking ports on $target..."
@@ -63,20 +64,28 @@ check_ports() {
             state="${BASH_REMATCH[2]}"
             if [ "$state" == "open" ]; then
                 open_ports+=("$port")
+            elif [ "$state" == "filtered" ]; then
+                filtered_ports+=("$port")
             else
                 closed_ports+=("$port")
             fi
         fi
     done < <(nmap -p"$ports" -Pn "$target" | grep "/tcp")
 
-    if [ ${#open_ports[@]} -eq 0 ]; then
-        print_color "$RED" "No required ports are open on $target."
-    elif [ ${#open_ports[@]} -eq $(echo $ports | tr ',' '\n' | wc -l) ]; then
-        print_color "$GREEN" "All required ports are open on $target."
+    if [ ${#open_ports[@]} -eq 0 ] && [ ${#filtered_ports[@]} -eq 0 ]; then
+        print_color "$RED" "No required ports are open or filtered on $target."
+    elif [ $((${#open_ports[@]} + ${#filtered_ports[@]})) -eq $(echo $ports | tr ',' '\n' | wc -l) ]; then
+        print_color "$GREEN" "All required ports are either open or filtered on $target."
     else
-        print_color "$YELLOW" "Some required ports are open on $target:"
-        echo "Open ports: ${open_ports[*]}"
-        echo "Closed or filtered ports: ${closed_ports[*]}"
+        print_color "$YELLOW" "Port status on $target:"
+        [ ${#open_ports[@]} -gt 0 ] && echo "Open ports: ${open_ports[*]}"
+        [ ${#filtered_ports[@]} -gt 0 ] && echo "Filtered ports: ${filtered_ports[*]}"
+        [ ${#closed_ports[@]} -gt 0 ] && echo "Closed ports: ${closed_ports[*]}"
+    fi
+
+    if [ ${#filtered_ports[@]} -gt 0 ]; then
+        print_color "$YELLOW" "Note: Filtered ports may be due to firewall rules or network configuration."
+        print_color "$YELLOW" "These ports might still be functional for Evernode."
     fi
 }
 
@@ -170,7 +179,8 @@ check_system_resources
 
 print_color "$YELLOW" "Port Status Summary:"
 print_color "$YELLOW" "--------------------"
-print_color "$YELLOW" "Ensure all required ports are open on both your gateway and localhost."
+print_color "$YELLOW" "Ensure all required ports are open or filtered on both your gateway and localhost."
+print_color "$YELLOW" "Filtered ports may still be functional for Evernode, but consider investigating further."
 print_color "$YELLOW" "If any ports are closed, configure your firewall to open them."
 print_color "$YELLOW" "For the gateway, you may need to set up port forwarding on your router."
 print_color "$YELLOW" "For localhost, check your UFW configuration and other local firewall settings."
