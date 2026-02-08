@@ -308,8 +308,8 @@ check_xrpl_balance() {
     
     print_color "$YELLOW" "\nChecking balance for $account_name: $account"
     
-    # Query XRPL using public API
-    local api_url="https://xrplcluster.com"
+    # Query Xahau using public API (Evernode runs on Xahau, not XRPL)
+    local api_url="https://xahau.network"
     
     local response=$(curl -s -X POST "$api_url" \
         -H "Content-Type: application/json" \
