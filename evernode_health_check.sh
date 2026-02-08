@@ -7,8 +7,11 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
-# Global error flag
+# Global error flag and tracking arrays
 HAS_ERRORS=0
+declare -a SUCCESS_MESSAGES=()
+declare -a WARNING_MESSAGES=()
+declare -a ERROR_MESSAGES=()
 
 # Function to print colored output
 print_color() {
@@ -21,6 +24,7 @@ print_color() {
 log_error() {
     local message=$1
     print_color "$RED" "ERROR: $message"
+    ERROR_MESSAGES+=("$message")
     HAS_ERRORS=1
 }
 
@@ -28,18 +32,56 @@ log_error() {
 log_warning() {
     local message=$1
     print_color "$YELLOW" "WARNING: $message"
+    WARNING_MESSAGES+=("$message")
 }
 
 # Function to log success
 log_success() {
     local message=$1
     print_color "$GREEN" "SUCCESS: $message"
+    SUCCESS_MESSAGES+=("$message")
 }
 
 # Function to log info
 log_info() {
     local message=$1
     print_color "$BLUE" "INFO: $message"
+}
+
+# Function to print summary report
+print_summary_report() {
+    print_color "$BLUE" "\n=========================================="
+    print_color "$BLUE" "           SUMMARY REPORT"
+    print_color "$BLUE" "=========================================="
+    
+    # Success messages
+    if [ ${#SUCCESS_MESSAGES[@]} -gt 0 ]; then
+        print_color "$GREEN" "\n✓ SUCCESSES (${#SUCCESS_MESSAGES[@]}):"
+        print_color "$GREEN" "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        for msg in "${SUCCESS_MESSAGES[@]}"; do
+            echo "  ✓ $msg"
+        done
+    fi
+    
+    # Warning messages
+    if [ ${#WARNING_MESSAGES[@]} -gt 0 ]; then
+        print_color "$YELLOW" "\n⚠ WARNINGS (${#WARNING_MESSAGES[@]}):"
+        print_color "$YELLOW" "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        for msg in "${WARNING_MESSAGES[@]}"; do
+            echo "  ⚠ $msg"
+        done
+    fi
+    
+    # Error messages
+    if [ ${#ERROR_MESSAGES[@]} -gt 0 ]; then
+        print_color "$RED" "\n✗ ERRORS (${#ERROR_MESSAGES[@]}):"
+        print_color "$RED" "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        for msg in "${ERROR_MESSAGES[@]}"; do
+            echo "  ✗ $msg"
+        done
+    fi
+    
+    print_color "$BLUE" "\n=========================================="
 }
 
 # Function to check if command exists
@@ -836,18 +878,25 @@ main() {
         log_warning "Fail2ban is not active or not installed"
     fi
     
-    # Final summary
+    # Print summary report
+    print_summary_report
+    
+    # Final status
     print_color "$BLUE" "\n====================================="
     print_color "$BLUE" "Health Check Complete"
     print_color "$BLUE" "====================================="
     
     if [ $HAS_ERRORS -eq 1 ]; then
-        print_color "$RED" "\n⚠ Errors were detected during the health check"
-        print_color "$RED" "Please review the output above and address any issues"
+        print_color "$RED" "\n⚠ ${#ERROR_MESSAGES[@]} error(s) detected - please review and address"
+        print_color "$YELLOW" "   ${#WARNING_MESSAGES[@]} warning(s) - recommended to review"
+        print_color "$GREEN" "   ${#SUCCESS_MESSAGES[@]} check(s) passed"
         exit 1
     else
         print_color "$GREEN" "\n✓ All checks passed successfully!"
-        print_color "$GREEN" "Your Evernode node appears to be healthy"
+        print_color "$GREEN" "   ${#SUCCESS_MESSAGES[@]} check(s) completed"
+        if [ ${#WARNING_MESSAGES[@]} -gt 0 ]; then
+            print_color "$YELLOW" "   ${#WARNING_MESSAGES[@]} warning(s) - optional improvements"
+        fi
     fi
 }
 
