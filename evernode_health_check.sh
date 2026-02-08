@@ -400,8 +400,8 @@ check_xrpl_balance() {
             }]
         }" 2>/dev/null)
     
-    # Look for EVR trustline (currency code: 4556520000000000000000000000000000000000)
-    local evr_line=$(echo "$trustlines_response" | jq -r '.result.lines[] | select(.currency == "4556520000000000000000000000000000000000") | .balance' 2>/dev/null | head -1)
+    # Look for EVR trustline (currency code: EVR, issuer: rEvernodee8dJLaFsujS6q1EiXvZYmHXr8)
+    local evr_line=$(echo "$trustlines_response" | jq -r '.result.lines[] | select(.currency == "EVR" and .account == "rEvernodee8dJLaFsujS6q1EiXvZYmHXr8") | .balance' 2>/dev/null | head -1)
     
     if [ -n "$evr_line" ] && [ "$evr_line" != "null" ]; then
         echo "  EVR Balance: $evr_line EVR"
