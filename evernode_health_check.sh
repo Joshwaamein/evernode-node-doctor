@@ -166,24 +166,31 @@ check_docker_status() {
         log_warning "$stopped_containers container(s) are stopped"
     fi
     
-    # Show Evernode-related containers (sashimono)
-    evernode_containers=$(docker ps -a --filter "name=sashimono" --format "{{.Names}}\t{{.Status}}\t{{.Image}}" 2>/dev/null)
+    # Show Evernode-related containers (sashimono or sashi-)
+    evernode_containers=$(docker ps -a --filter "name=sashi" --format "{{.Names}}\t{{.Status}}\t{{.Image}}" 2>/dev/null)
     if [ -n "$evernode_containers" ]; then
-        echo -e "\nEvernode (Sashimono) Containers:"
+        container_count=$(echo "$evernode_containers" | wc -l)
+        echo -e "\nEvernode (Sashimono) Containers Found: $container_count"
         echo "$evernode_containers" | column -t
         
         # Check if any sashimono containers are not running
-        stopped_sashimono=$(docker ps -a --filter "name=sashimono" --filter "status=exited" --format "{{.Names}}" 2>/dev/null)
+        stopped_sashimono=$(docker ps -a --filter "name=sashi" --filter "status=exited" --format "{{.Names}}" 2>/dev/null)
         if [ -n "$stopped_sashimono" ]; then
             log_error "Some Evernode containers are not running: $stopped_sashimono"
         else
-            running_sashimono=$(docker ps --filter "name=sashimono" --format "{{.Names}}" 2>/dev/null | wc -l)
+            running_sashimono=$(docker ps --filter "name=sashi" --format "{{.Names}}" 2>/dev/null | wc -l)
             if [ "$running_sashimono" -gt 0 ]; then
-                log_success "All Evernode containers are running"
+                log_success "All $running_sashimono Evernode container(s) are running"
             fi
         fi
     else
-        log_warning "No Evernode (sashimono) containers found. Has Evernode been installed?"
+        # If we found Evernode CLI installed, containers might be managed differently
+        if check_command "evernode" &>/dev/null; then
+            log_info "No Docker containers with 'sashi' prefix found"
+            echo "Note: Evernode containers may be managed through the Evernode CLI"
+        else
+            log_warning "No Evernode (sashimono) containers found. Has Evernode been installed?"
+        fi
     fi
     
     # Check Docker disk usage
@@ -382,31 +389,45 @@ check_evernode_installation() {
         return 1
     fi
     
-    # Check Evernode configuration directory
-    evernode_config_dir="$HOME/.evernode"
-    if [ -d "$evernode_config_dir" ]; then
-        log_success "Evernode configuration directory exists: $evernode_config_dir"
-        
-        # Check for important config files
-        if [ -f "$evernode_config_dir/config.json" ]; then
-            echo "Configuration file found: config.json"
-        else
-            log_warning "Configuration file not found: config.json"
+    # Check for Evernode configuration in common locations
+    evernode_config_found=0
+    possible_config_dirs=("$HOME/.evernode" "/home/sashimono/.evernode" "/root/.evernode")
+    
+    for config_dir in "${possible_config_dirs[@]}"; do
+        if [ -d "$config_dir" ]; then
+            log_success "Evernode configuration directory found: $config_dir"
+            evernode_config_found=1
+            
+            # Check for important config files
+            if [ -f "$config_dir/config.json" ]; then
+                echo "Configuration file found: config.json"
+            else
+                log_warning "Configuration file not found: config.json"
+            fi
+            break
         fi
-    else
-        log_warning "Evernode configuration directory not found: $evernode_config_dir"
+    done
+    
+    if [ $evernode_config_found -eq 0 ]; then
+        log_warning "Evernode configuration directory not found in common locations"
+        echo "Note: Evernode may be installed under a different user account"
+    fi
+    
+    # Check Sashimono configuration (more reliable for Evernode)
+    if [ -f "/etc/sashimono/mb-xrpl/mb-xrpl.cfg" ]; then
+        log_success "Sashimono configuration found (Evernode is properly configured)"
     fi
     
     # Check Evernode service status
-    if systemctl list-unit-files | grep -q "evernode"; then
-        evernode_service=$(systemctl list-unit-files | grep evernode | awk '{print $1}' | head -1)
-        if systemctl is-active --quiet "$evernode_service"; then
-            log_success "Evernode service is running: $evernode_service"
+    if systemctl list-unit-files | grep -q "evernode\|sashimono"; then
+        evernode_service=$(systemctl list-unit-files | grep "evernode\|sashimono" | awk '{print $1}' | head -1)
+        if systemctl is-active --quiet "$evernode_service" 2>/dev/null; then
+            log_success "Evernode/Sashimono service is running: $evernode_service"
         else
-            log_error "Evernode service is not running: $evernode_service"
+            log_warning "Evernode/Sashimono service may not be running: $evernode_service"
         fi
     else
-        log_warning "No Evernode systemd service found"
+        log_info "No Evernode systemd service found (may be managed differently)"
     fi
 }
 
@@ -451,19 +472,46 @@ check_evernode_accounts() {
         }
     fi
     
-    # Try to auto-detect accounts from Evernode config
-    evernode_config="$HOME/.evernode/config.json"
+    # Try to auto-detect accounts from multiple possible config locations
+    evernode_configs=(
+        "$HOME/.evernode/config.json"
+        "/home/sashimono/.evernode/config.json"
+        "/root/.evernode/config.json"
+        "/etc/sashimono/mb-xrpl/mb-xrpl.cfg"
+        "/etc/sashimono/reputationd/reputationd.cfg"
+    )
+    
     auto_host_account=""
     auto_rep_account=""
     
-    if [ -f "$evernode_config" ]; then
-        auto_host_account=$(jq -r '.host.address // empty' "$evernode_config" 2>/dev/null)
-        auto_rep_account=$(jq -r '.reputation.address // empty' "$evernode_config" 2>/dev/null)
+    # Try to extract from Sashimono config files
+    if [ -f "/etc/sashimono/mb-xrpl/mb-xrpl.cfg" ]; then
+        auto_host_account=$(grep -oP 'address=\K[a-zA-Z0-9]+' /etc/sashimono/mb-xrpl/mb-xrpl.cfg 2>/dev/null | head -1)
+    fi
+    
+    if [ -f "/etc/sashimono/reputationd/reputationd.cfg" ]; then
+        auto_rep_account=$(grep -oP 'address=\K[a-zA-Z0-9]+' /etc/sashimono/reputationd/reputationd.cfg 2>/dev/null | head -1)
+    fi
+    
+    # Try JSON configs if not found in cfg files
+    if [ -z "$auto_host_account" ] || [ -z "$auto_rep_account" ]; then
+        for config_file in "${evernode_configs[@]}"; do
+            if [ -f "$config_file" ] && [[ "$config_file" == *.json ]]; then
+                if [ -z "$auto_host_account" ]; then
+                    auto_host_account=$(jq -r '.host.address // empty' "$config_file" 2>/dev/null)
+                fi
+                if [ -z "$auto_rep_account" ]; then
+                    auto_rep_account=$(jq -r '.reputation.address // empty' "$config_file" 2>/dev/null)
+                fi
+                [ -n "$auto_host_account" ] && [ -n "$auto_rep_account" ] && break
+            fi
+        done
     fi
     
     # Prompt for host account (with auto-detected default)
     if [ -n "$auto_host_account" ]; then
-        read -p "Enter your Evernode host account address [detected: $auto_host_account] (or press Enter to use detected): " host_account
+        echo "Auto-detected host account: $auto_host_account"
+        read -p "Press Enter to check this account, or enter a different address: " host_account
         host_account=${host_account:-$auto_host_account}
     else
         read -p "Enter your Evernode host account address (or press Enter to skip): " host_account
@@ -477,7 +525,8 @@ check_evernode_accounts() {
     
     # Prompt for reputation account (with auto-detected default)
     if [ -n "$auto_rep_account" ]; then
-        read -p "Enter your Evernode reputation account address [detected: $auto_rep_account] (or press Enter to use detected): " reputation_account
+        echo "Auto-detected reputation account: $auto_rep_account"
+        read -p "Press Enter to check this account, or enter a different address: " reputation_account
         reputation_account=${reputation_account:-$auto_rep_account}
     else
         read -p "Enter your Evernode reputation account address (or press Enter to skip): " reputation_account
@@ -506,7 +555,17 @@ run_nmap_scan() {
     local target=$1
     local ports=$2
     print_color "$YELLOW" "Running nmap scan on $target..."
-    nmap -p"$ports" -Pn "$target"
+    
+    if [ -z "$ports" ]; then
+        log_error "No ports provided for nmap scan"
+        return 1
+    fi
+    
+    # Run nmap with proper error handling
+    if ! nmap -p"$ports" -Pn "$target" 2>&1; then
+        log_warning "Nmap scan failed for $target"
+        return 1
+    fi
 }
 
 # Function to verify UFW configuration
@@ -593,21 +652,26 @@ check_ssl_certificate() {
 generate_report() {
     local domain=$1
     local lan_ip=$2
-    local required_ports=("$@")
     shift 2
+    local required_ports=("$@")
 
-    print_color "$YELLOW" "Generating Comprehensive Report"
-    print_color "$YELLOW" "--------------------------------"
+    print_color "$YELLOW" "\n=== Comprehensive Port and Configuration Report ==="
     
     echo "Domain: $domain"
     echo "LAN IP: $lan_ip"
     echo "Required Ports: ${required_ports[*]}"
     
-    echo -e "\nNmap Scan Results (Domain):"
-    run_nmap_scan "$domain" "$(IFS=,; echo "${required_ports[*]}")"
-    
-    echo -e "\nNmap Scan Results (LAN IP):"
-    run_nmap_scan "$lan_ip" "$(IFS=,; echo "${required_ports[*]}")"
+    # Only run nmap if we have ports to scan
+    if [ ${#required_ports[@]} -gt 0 ]; then
+        echo -e "\nNmap Scan Results (Domain):"
+        ports_csv=$(IFS=,; echo "${required_ports[*]}")
+        run_nmap_scan "$domain" "$ports_csv"
+        
+        echo -e "\nNmap Scan Results (LAN IP):"
+        run_nmap_scan "$lan_ip" "$ports_csv"
+    else
+        log_warning "No ports to scan"
+    fi
     
     echo -e "\nUFW Configuration:"
     verify_ufw_configuration "${required_ports[@]}"
