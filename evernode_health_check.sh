@@ -102,7 +102,7 @@ install_deps() {
         return 1
     fi
     
-    if ! apt-get install -y nmap dnsutils curl ufw openssl jq docker.io 2>/dev/null; then
+    if ! apt-get install -y nmap dnsutils curl ufw openssl jq docker.io bc net-tools 2>/dev/null; then
         log_warning "Some dependencies failed to install. Continuing anyway..."
     fi
     
@@ -431,33 +431,40 @@ check_evernode_installation() {
         return 1
     fi
     
-    # Check for Evernode configuration in common locations
-    evernode_config_found=0
-    possible_config_dirs=("$HOME/.evernode" "/home/sashimono/.evernode" "/root/.evernode")
-    
-    for config_dir in "${possible_config_dirs[@]}"; do
-        if [ -d "$config_dir" ]; then
-            log_success "Evernode configuration directory found: $config_dir"
-            evernode_config_found=1
-            
-            # Check for important config files
-            if [ -f "$config_dir/config.json" ]; then
-                echo "Configuration file found: config.json"
-            else
-                log_warning "Configuration file not found: config.json"
-            fi
-            break
+    # Check Sashimono configuration directory (primary Evernode config location)
+    if [ -d "/etc/sashimono" ]; then
+        log_success "Evernode configuration directory found: /etc/sashimono"
+        
+        # Check for important config files
+        if [ -f "/etc/sashimono/mb-xrpl/mb-xrpl.cfg" ]; then
+            log_success "Host configuration file found: mb-xrpl.cfg"
+        else
+            log_warning "Host configuration file not found: mb-xrpl.cfg"
         fi
-    done
-    
-    if [ $evernode_config_found -eq 0 ]; then
-        log_warning "Evernode configuration directory not found in common locations"
-        echo "Note: Evernode may be installed under a different user account"
-    fi
-    
-    # Check Sashimono configuration (more reliable for Evernode)
-    if [ -f "/etc/sashimono/mb-xrpl/mb-xrpl.cfg" ]; then
-        log_success "Sashimono configuration found (Evernode is properly configured)"
+        
+        if [ -f "/etc/sashimono/reputationd/reputationd.cfg" ]; then
+            log_success "Reputation configuration file found: reputationd.cfg"
+        else
+            log_warning "Reputation configuration file not found: reputationd.cfg"
+        fi
+    else
+        log_warning "Evernode configuration directory not found: /etc/sashimono"
+        
+        # Check alternative locations as fallback
+        evernode_config_found=0
+        possible_config_dirs=("$HOME/.evernode" "/home/sashimono/.evernode" "/root/.evernode")
+        
+        for config_dir in "${possible_config_dirs[@]}"; do
+            if [ -d "$config_dir" ]; then
+                log_success "Alternative Evernode configuration found: $config_dir"
+                evernode_config_found=1
+                break
+            fi
+        done
+        
+        if [ $evernode_config_found -eq 0 ]; then
+            log_error "No Evernode configuration found. Has Evernode been installed?"
+        fi
     fi
     
     # Check Evernode service status
