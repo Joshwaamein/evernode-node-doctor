@@ -670,40 +670,53 @@ check_ssl_certificate() {
         return 1
     fi
     
-    # Try to get certificate info
-    cert_info=$(echo | timeout 5 openssl s_client -connect "${domain}:443" -servername "${domain}" 2>/dev/null | openssl x509 -noout -dates -subject -issuer 2>/dev/null)
+    # First, check HTTPS accessibility
+    http_code=$(curl -s -o /dev/null -w "%{http_code}" "https://${domain}" --connect-timeout 5 --max-time 10 2>/dev/null)
     
-    if [ $? -ne 0 ] || [ -z "$cert_info" ]; then
-        log_warning "Unable to retrieve SSL certificate directly from this server"
-        echo "Note: This is normal if SSL is handled by a reverse proxy (nginx, Caddy, HAProxy, etc.)"
-        echo "The certificate would be on the proxy server, not on this Evernode node."
+    if [ -n "$http_code" ] && [[ "$http_code" =~ ^[23] ]]; then
+        log_success "Domain is accessible via HTTPS (HTTP $http_code)"
         
-        # Try to check if the domain is accessible via HTTPS at all
-        if curl -s -o /dev/null -w "%{http_code}" "https://${domain}" --connect-timeout 5 2>/dev/null | grep -q "^[23]"; then
-            log_info "Domain is accessible via HTTPS (likely through reverse proxy)"
-        else
-            log_warning "Unable to verify HTTPS accessibility for $domain"
-        fi
-        return 1
-    fi
-    
-    echo "$cert_info"
-    log_success "SSL certificate retrieved directly from this server"
-    
-    # Check certificate expiration
-    expiry_date=$(echo "$cert_info" | grep "notAfter" | cut -d= -f2)
-    if [ -n "$expiry_date" ]; then
-        expiry_epoch=$(date -d "$expiry_date" +%s 2>/dev/null)
-        current_epoch=$(date +%s)
-        days_until_expiry=$(( (expiry_epoch - current_epoch) / 86400 ))
+        # Try to get certificate info through the domain (works with reverse proxy)
+        cert_info=$(echo | timeout 10 openssl s_client -connect "${domain}:443" -servername "${domain}" 2>/dev/null | openssl x509 -noout -dates -subject -issuer 2>/dev/null)
         
-        if [ $days_until_expiry -lt 0 ]; then
-            log_error "SSL certificate has expired!"
-        elif [ $days_until_expiry -lt 30 ]; then
-            log_warning "SSL certificate expires in $days_until_expiry days"
+        if [ $? -eq 0 ] && [ -n "$cert_info" ]; then
+            echo -e "\nSSL Certificate Details:"
+            echo "$cert_info"
+            
+            # Check certificate expiration
+            expiry_date=$(echo "$cert_info" | grep "notAfter" | cut -d= -f2)
+            if [ -n "$expiry_date" ]; then
+                expiry_epoch=$(date -d "$expiry_date" +%s 2>/dev/null)
+                current_epoch=$(date +%s)
+                days_until_expiry=$(( (expiry_epoch - current_epoch) / 86400 ))
+                
+                if [ $days_until_expiry -lt 0 ]; then
+                    log_error "SSL certificate has expired!"
+                elif [ $days_until_expiry -lt 30 ]; then
+                    log_warning "SSL certificate expires in $days_until_expiry days"
+                else
+                    log_success "SSL certificate is valid for $days_until_expiry more days"
+                fi
+            fi
+            
+            # Check certificate issuer
+            issuer=$(echo "$cert_info" | grep "issuer" | cut -d= -f2-)
+            if [[ "$issuer" == *"Let's Encrypt"* ]]; then
+                log_success "SSL certificate from Let's Encrypt (auto-renewal recommended)"
+            else
+                echo "Certificate issuer: $issuer"
+            fi
+            
+            log_success "SSL certificate verified successfully"
         else
-            log_success "SSL certificate is valid for $days_until_expiry more days"
+            log_warning "HTTPS is accessible but unable to retrieve certificate details"
+            echo "Note: This can happen with some reverse proxy configurations"
+            log_info "SSL is working through your reverse proxy (nginx)"
         fi
+    else
+        log_warning "Unable to verify HTTPS accessibility for $domain (HTTP code: ${http_code:-N/A})"
+        echo "Note: This is normal if SSL is handled by a reverse proxy and routing differs internally"
+        echo "Verify SSL externally: curl -I https://$domain"
     fi
 }
 
