@@ -726,7 +726,21 @@ main() {
     
     # Domain and network configuration
     print_color "$YELLOW" "\n=== Domain and Network Configuration ==="
-    read -p "Enter the domain name of your Evernode host: " domain_name
+    
+    # Try to auto-detect domain from Evernode config
+    auto_domain=""
+    if [ -f "/etc/sashimono/reputationd/reputationd.cfg" ]; then
+        auto_domain=$(jq -r '.contractInstance.domain // empty' /etc/sashimono/reputationd/reputationd.cfg 2>/dev/null)
+    fi
+    
+    # Prompt with auto-detected domain as default
+    if [ -n "$auto_domain" ]; then
+        echo "Auto-detected domain: $auto_domain"
+        read -p "Press Enter to use this domain, or enter a different one: " domain_name
+        domain_name=${domain_name:-$auto_domain}
+    else
+        read -p "Enter the domain name of your Evernode host: " domain_name
+    fi
     
     if [ -z "$domain_name" ]; then
         log_error "Domain name cannot be empty"
