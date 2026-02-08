@@ -617,19 +617,29 @@ check_ssl_certificate() {
     print_color "$YELLOW" "Checking SSL certificate for $domain..."
     
     if ! check_command "openssl"; then
-        log_error "OpenSSL is not installed"
+        log_warning "OpenSSL is not installed. Skipping SSL check"
         return 1
     fi
     
     # Try to get certificate info
-    cert_info=$(echo | openssl s_client -connect "${domain}:443" -servername "${domain}" 2>/dev/null | openssl x509 -noout -dates -subject -issuer 2>/dev/null)
+    cert_info=$(echo | timeout 5 openssl s_client -connect "${domain}:443" -servername "${domain}" 2>/dev/null | openssl x509 -noout -dates -subject -issuer 2>/dev/null)
     
     if [ $? -ne 0 ] || [ -z "$cert_info" ]; then
-        log_error "Failed to retrieve SSL certificate information for $domain"
+        log_warning "Unable to retrieve SSL certificate directly from this server"
+        echo "Note: This is normal if SSL is handled by a reverse proxy (nginx, Caddy, HAProxy, etc.)"
+        echo "The certificate would be on the proxy server, not on this Evernode node."
+        
+        # Try to check if the domain is accessible via HTTPS at all
+        if curl -s -o /dev/null -w "%{http_code}" "https://${domain}" --connect-timeout 5 2>/dev/null | grep -q "^[23]"; then
+            log_info "Domain is accessible via HTTPS (likely through reverse proxy)"
+        else
+            log_warning "Unable to verify HTTPS accessibility for $domain"
+        fi
         return 1
     fi
     
     echo "$cert_info"
+    log_success "SSL certificate retrieved directly from this server"
     
     # Check certificate expiration
     expiry_date=$(echo "$cert_info" | grep "notAfter" | cut -d= -f2)
