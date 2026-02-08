@@ -794,7 +794,8 @@ main() {
     if [ "$auto_instance_count" -eq 0 ] && check_command "evernode" &>/dev/null; then
         evernode_status_output=$(evernode status 2>/dev/null)
         if [ -n "$evernode_status_output" ]; then
-            # Look for "Available Lease offers: X out of Y" pattern
+            # Look for "Available Lease offers: X out of Y" pattern and extract Y (total instances)
+            # The \K in the regex discards everything before it, so we capture only Y
             auto_instance_count=$(echo "$evernode_status_output" | grep -oP 'Available Lease offers: \d+ out of \K\d+' 2>/dev/null)
         fi
     fi
