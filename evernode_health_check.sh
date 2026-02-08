@@ -782,12 +782,38 @@ main() {
     fi
 
     # Instance count and port configuration
-    read -p "How many Evernode instances do you have? " instance_count
+    print_color "$YELLOW" "\n=== Instance Count Detection ==="
+    
+    # Try to auto-detect instance count from running containers
+    auto_instance_count=0
+    if check_command "docker" &>/dev/null; then
+        auto_instance_count=$(docker ps --filter "name=sashi" --format "{{.Names}}" 2>/dev/null | wc -l)
+    fi
+    
+    # Alternative: try to parse from evernode status
+    if [ "$auto_instance_count" -eq 0 ] && check_command "evernode" &>/dev/null; then
+        evernode_status_output=$(evernode status 2>/dev/null)
+        if [ -n "$evernode_status_output" ]; then
+            # Look for "Available Lease offers: X out of Y" pattern
+            auto_instance_count=$(echo "$evernode_status_output" | grep -oP 'Available Lease offers: \d+ out of \K\d+' 2>/dev/null)
+        fi
+    fi
+    
+    # Prompt with auto-detected value as default
+    if [ "$auto_instance_count" -gt 0 ]; then
+        echo "Auto-detected $auto_instance_count Evernode instance(s)"
+        read -p "Press Enter to use this count, or enter a different number: " instance_count
+        instance_count=${instance_count:-$auto_instance_count}
+    else
+        read -p "How many Evernode instances do you have? " instance_count
+    fi
     
     if ! [[ "$instance_count" =~ ^[0-9]+$ ]] || [ "$instance_count" -lt 1 ]; then
         log_error "Invalid instance count. Must be a positive number"
         exit 1
     fi
+    
+    echo "Using instance count: $instance_count"
 
     required_ports=($(calculate_required_ports "$instance_count"))
 
