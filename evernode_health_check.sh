@@ -484,13 +484,13 @@ check_evernode_accounts() {
     auto_host_account=""
     auto_rep_account=""
     
-    # Try to extract from Sashimono config files
+    # Try to extract from Sashimono config files (JSON format)
     if [ -f "/etc/sashimono/mb-xrpl/mb-xrpl.cfg" ]; then
-        auto_host_account=$(grep -oP 'address=\K[a-zA-Z0-9]+' /etc/sashimono/mb-xrpl/mb-xrpl.cfg 2>/dev/null | head -1)
+        auto_host_account=$(jq -r '.xrpl.address // empty' /etc/sashimono/mb-xrpl/mb-xrpl.cfg 2>/dev/null)
     fi
     
     if [ -f "/etc/sashimono/reputationd/reputationd.cfg" ]; then
-        auto_rep_account=$(grep -oP 'address=\K[a-zA-Z0-9]+' /etc/sashimono/reputationd/reputationd.cfg 2>/dev/null | head -1)
+        auto_rep_account=$(jq -r '.xrpl.address // empty' /etc/sashimono/reputationd/reputationd.cfg 2>/dev/null)
     fi
     
     # Try JSON configs if not found in cfg files
