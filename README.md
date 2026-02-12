@@ -8,6 +8,12 @@ The **Evernode Node Doctor** is a comprehensive, one-stop validation tool that v
 ### 📋 Evernode Log Analysis
 Automatically analyzes Evernode logs for errors, failures, and critical issues. Generates comprehensive logs via `evernode log` command and searches for problems. Includes 5-second warning and `--skip-logs` option to skip this intensive check.
 
+### 🔒 Strict Xahau Node State Validation
+The Xahau node health check now strictly requires `server_state: "full"` for proper operation. Previously accepted "validating" or "proposing", but now only "full" state is considered healthy. This ensures your node is fully synchronized before accepting tenant instances.
+
+### 🔌 Enhanced API Version 1 Support
+Added dedicated `server_info` check with `api_version: 1` parameter for better compatibility and validation. This provides an additional verification layer for Xahau node connectivity.
+
 ## ✨ Features from v2.5
 
 ### 🤖 Cron Mode - Full Automation
@@ -738,6 +744,9 @@ For Evernode-related questions, visit the official Evernode documentation and co
 ### Version 2.6 (Current)
 - **Added Evernode Log Analysis**: Analyzes `evernode log` output for errors and failures
 - **Added --skip-logs Flag**: Skip intensive log generation (saves 1-2 minutes)
+- **Added Strict Server State Validation**: Now requires `server_state: "full"` for proper operation (previously accepted "validating" or "proposing")
+- **Added API Version 1 Support**: Dedicated `server_info` check with `api_version: 1` parameter for enhanced Xahau node validation
+- **Enhanced Xahau Health Checks**: Auto-detects endpoint from config and performs multiple validation methods
 - **Added Early Warning System**: 5-second countdown before starting checks
 - **Added Options Display**: Shows available flags at script start
 - **Added ASCII Art Banner**: Professional "EVERNODE NODE DOCTOR" header

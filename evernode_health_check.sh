@@ -621,11 +621,9 @@ check_xahau_wss_connection() {
             echo "  Server State: $server_state"
             
             if [ "$server_state" == "full" ]; then
-                log_success "Xahau node is fully synced"
-            elif [ "$server_state" == "validating" ] || [ "$server_state" == "proposing" ]; then
-                log_success "Xahau node is active ($server_state)"
+                log_success "Xahau node is fully synced (server_state: full)"
             else
-                log_warning "Xahau node state: $server_state (may be syncing)"
+                log_error "Xahau node state: $server_state (MUST be 'full' to work properly)"
             fi
             return 0
         else
@@ -636,11 +634,42 @@ check_xahau_wss_connection() {
         echo "Tip: Install websocat for better WSS testing: apt-get install websocat"
     fi
     
-    # Method 2: Fallback to HTTPS API (if WSS fails or websocat unavailable)
-    log_info "Testing with HTTPS API fallback..."
+    # Method 2: Additional check with API version 1
+    log_info "Testing server_info with API version 1..."
     
     # Convert wss:// to https:// for API testing
     https_endpoint="${wss_endpoint//wss:/https:}"
+    
+    # Check with api_version: 1 parameter
+    api_v1_response=$(curl -s -X POST "$https_endpoint" \
+        -H "Content-Type: application/json" \
+        -d '{"method":"server_info","params":[{"api_version":1}]}' \
+        --connect-timeout 10 --max-time 15 2>&1)
+    
+    if [ $? -eq 0 ] && echo "$api_v1_response" | jq -e '.result' &>/dev/null; then
+        log_success "Server info check with API version 1 successful"
+        
+        server_state_v1=$(echo "$api_v1_response" | jq -r '.result.info.server_state // "unknown"' 2>/dev/null)
+        echo "  Server State (API v1): $server_state_v1"
+        
+        if [ "$server_state_v1" == "full" ]; then
+            log_success "Xahau node is fully synced (server_state: full)"
+        else
+            log_error "Xahau node state: $server_state_v1 (MUST be 'full' to work properly)"
+        fi
+        
+        build_version_v1=$(echo "$api_v1_response" | jq -r '.result.info.build_version // "unknown"' 2>/dev/null)
+        complete_ledgers_v1=$(echo "$api_v1_response" | jq -r '.result.info.complete_ledgers // "unknown"' 2>/dev/null)
+        
+        echo "  Xahau Version: $build_version_v1"
+        echo "  Ledger Range: $complete_ledgers_v1"
+        return 0
+    else
+        log_warning "API version 1 check failed, trying standard API fallback..."
+    fi
+    
+    # Method 3: Fallback to HTTPS API (if WSS and API v1 fail or websocat unavailable)
+    log_info "Testing with HTTPS API fallback..."
     
     api_response=$(curl -s -X POST "$https_endpoint" \
         -H "Content-Type: application/json" \
@@ -659,11 +688,9 @@ check_xahau_wss_connection() {
         echo "  Server State: $server_state"
         
         if [ "$server_state" == "full" ]; then
-            log_success "Xahau node is fully synced"
-        elif [ "$server_state" == "validating" ] || [ "$server_state" == "proposing" ]; then
-            log_success "Xahau node is active ($server_state)"
+            log_success "Xahau node is fully synced (server_state: full)"
         else
-            log_warning "Xahau node state: $server_state"
+            log_error "Xahau node state: $server_state (MUST be 'full' to work properly)"
         fi
         return 0
     else

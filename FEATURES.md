@@ -1,5 +1,84 @@
 # Evernode Node Doctor - New Features Quick Reference
 
+## 🚀 Version 2.6 Features
+
+### 1. Strict Xahau Node State Validation
+
+**Purpose**: Ensure Xahau node is in "full" state before accepting tenant instances.
+
+**What Changed:**
+- Previously accepted: `full`, `validating`, or `proposing`
+- Now requires: **`full` ONLY**
+
+**Why This Matters:**
+- Ensures node is fully synchronized with the Xahau blockchain
+- Prevents issues with tenant instances on partially synced nodes
+- Provides clearer error messages when node is not ready
+
+**Example Output:**
+```
+Server State: full
+✓ Xahau node is fully synced (server_state: full)
+
+# If not "full":
+Server State: syncing
+✗ ERROR: Xahau node state: syncing (MUST be 'full' to work properly)
+```
+
+---
+
+### 2. API Version 1 Support
+
+**Purpose**: Enhanced Xahau node validation with dedicated API version 1 check.
+
+**What It Does:**
+- Adds a separate `server_info` check using `api_version: 1` parameter
+- Provides additional verification layer for node connectivity
+- Auto-detects Xahau endpoint from config file
+
+**Check Sequence:**
+1. **Method 1**: WebSocket test using websocat (if available)
+2. **Method 2**: HTTPS API with `api_version: 1` ✨ NEW
+3. **Method 3**: Standard HTTPS API fallback
+
+**Example Output:**
+```
+=== Xahau WSS Connection Health Check ===
+Configured Xahau WSS Endpoint: wss://xahau.network
+
+Testing server_info with API version 1...
+✓ Server info check with API version 1 successful
+  Server State (API v1): full
+✓ Xahau node is fully synced (server_state: full)
+  Xahau Version: 2024.11.19+619
+  Ledger Range: 1000000-1234567
+```
+
+**Configuration:**
+The script automatically reads your configured endpoint from:
+`/etc/sashimono/mb-xrpl/mb-xrpl.cfg`
+
+No manual configuration needed!
+
+---
+
+### 3. Enhanced Multi-Method Validation
+
+**Purpose**: Multiple validation methods ensure robust connectivity checking.
+
+**Three-Tier Approach:**
+1. **WebSocket (websocat)**: Fastest, most reliable if websocat installed
+2. **API v1 (HTTPS)**: Enhanced validation with explicit API version
+3. **Standard API (HTTPS)**: Fallback for maximum compatibility
+
+**Benefits:**
+- ✅ Works even if websocat not installed
+- ✅ Multiple validation points for confidence
+- ✅ Clear indication which method succeeded
+- ✅ Detailed error messages if all methods fail
+
+---
+
 ## 🚀 Version 2.5 Features
 
 ### 1. Cron Mode (`--cron`)
