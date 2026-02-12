@@ -3,6 +3,25 @@
 ## Overview
 The **Evernode Node Doctor** is a comprehensive, one-stop validation tool that verifies all requirements for running an Evernode node are properly met. This bash script performs exhaustive checks across system resources, Docker infrastructure, network configuration, security settings, and XRPL account balances to ensure your Evernode host is production-ready.
 
+## ✨ New Features (v2.6)
+
+### 📋 Evernode Log Analysis
+Automatically analyzes Evernode logs for errors, failures, and critical issues. Generates comprehensive logs via `evernode log` command and searches for problems. Includes 5-second warning and `--skip-logs` option to skip this intensive check.
+
+## ✨ Features from v2.5
+
+### 🤖 Cron Mode - Full Automation
+Run the script in non-interactive mode for automated monitoring with complete auto-detection of all configuration values.
+
+### 🔍 Port Usage Analysis
+Advanced analysis showing which ports are open in firewall vs actually listening, with security warnings for open but unused ports (addresses the common issue of ports 80/443 being open but not in use).
+
+### 📝 Port Purpose Documentation
+Every port now includes a clear explanation of its purpose and what service should be using it.
+
+### 🌐 Xahau WSS Health Check
+Test your Xahau WebSocket connection using websocat (safe, no npm conflicts!) with automatic fallback to HTTPS API.
+
 ## Why Use This Tool?
 
 Running an Evernode node requires meeting numerous technical requirements across multiple system components. This script automates the validation of ALL these requirements, helping you:
@@ -10,7 +29,8 @@ Running an Evernode node requires meeting numerous technical requirements across
 - **Pre-Installation Validation**: Verify your system meets all prerequisites before installing Evernode
 - **Post-Installation Verification**: Confirm your Evernode installation is configured correctly
 - **Troubleshooting**: Quickly identify configuration issues or missing requirements
-- **Ongoing Monitoring**: Regular health checks to ensure continued operational readiness
+- **Ongoing Monitoring**: Regular health checks to ensure continued operational readiness (with cron mode)
+- **Security Auditing**: Identify open but unused ports and other security issues
 
 ## Comprehensive Validation Features
 
@@ -79,7 +99,11 @@ Running an Evernode node requires meeting numerous technical requirements across
 - LAN IP detection
 - DNS mismatch detection and reporting
 
-### 8. Port Configuration & Accessibility
+### 8. Port Configuration & Accessibility (🆕 ENHANCED)
+- **Port Purpose Documentation**: Each port now displays its intended purpose
+- **Port Usage Analysis**: Shows firewall status vs actual listening status
+- **Security Warnings**: Flags ports that are open in firewall but nothing is listening
+- **Process Detection**: Shows which service is using each port
 - Automatic port calculation based on instance count:
   - User ports: 22861+
   - Peer ports: 26201+
@@ -90,7 +114,14 @@ Running an Evernode node requires meeting numerous technical requirements across
 - Port accessibility verification
 - UFW rule validation for all required ports
 
-### 9. XRPL Account Balance Verification (CRITICAL)
+### 9. Xahau WSS Connection Health (🆕 NEW)
+- **Automatic Endpoint Detection**: Reads WSS endpoint from config
+- **WebSocket Testing**: Uses websocat (safe, no npm conflicts!)
+- **HTTPS API Fallback**: Works even without websocat installed
+- **Node Status**: Reports Xahau version, ledger sync, server state
+- **Connection Validation**: Ensures your node can communicate with Xahau network
+
+### 10. XRPL Account Balance Verification (CRITICAL)
 - **Auto-Detection**: Reads accounts from Evernode config.json
 - **Host Account Validation**:
   - XAH balance check (minimum 50 XAH recommended)
@@ -102,13 +133,13 @@ Running an Evernode node requires meeting numerous technical requirements across
 - **Real-time Balance**: Queries validated ledger state
 - **Insufficient Balance Warnings**: Clear alerts if below thresholds
 
-### 10. Evernode Host Status
+### 11. Evernode Host Status
 - Retrieves current host status via Evernode CLI
 - Registration status verification
 - Host configuration display
 - Operational status reporting
 
-### 11. Comprehensive Error Handling
+### 12. Comprehensive Error Handling
 - Color-coded output (Blue/Green/Yellow/Red)
 - Global error tracking
 - Input validation for all prompts
@@ -119,7 +150,8 @@ Running an Evernode node requires meeting numerous technical requirements across
 
 ## Usage
 
-### Basic Usage
+### Installation
+
 1. Clone the repository or download the script:
    ```bash
    git clone https://github.com/Joshwaamein/evernode-node-doctor.git
@@ -131,32 +163,56 @@ Running an Evernode node requires meeting numerous technical requirements across
    chmod +x evernode_health_check.sh
    ```
 
-3. Run with sudo privileges (REQUIRED):
-   ```bash
-   sudo ./evernode_health_check.sh
-   ```
+### Interactive Mode (Default)
 
-### Interactive Prompts
+Run with sudo privileges (REQUIRED):
+```bash
+sudo ./evernode_health_check.sh
+```
+
 During execution, the script will prompt you for:
+1. **Domain name** of your Evernode host (REQUIRED) - Auto-detected if available
+2. **Number of Evernode instances** (REQUIRED) - Auto-detected if available
+3. **Evernode host account address** (OPTIONAL) - Auto-detected from config if available
+4. **Evernode reputation account address** (OPTIONAL) - Auto-detected from config if available
 
-1. **Domain name** of your Evernode host (REQUIRED)
-   - Example: `myhost.example.com`
+### 🤖 Cron Mode (Non-Interactive - NEW!)
 
-2. **Number of Evernode instances** (REQUIRED)
-   - Used to calculate required ports
-   - Example: `2`
+Run in fully automated mode with zero user interaction:
 
-3. **Evernode host account address** (OPTIONAL)
-   - Auto-detected from config if available
-   - Example: `rXXXXXXXXXXXXXXXXXXXXXXXXXXX`
-   - Press Enter to skip if not applicable
+```bash
+# Basic cron mode
+sudo ./evernode_health_check.sh --cron
 
-4. **Evernode reputation account address** (OPTIONAL)
-   - Auto-detected from config if available
-   - Example: `rYYYYYYYYYYYYYYYYYYYYYYYYYYY`
-   - Press Enter to skip if not applicable
+# Cron mode with log-friendly output (no color codes)
+sudo ./evernode_health_check.sh --cron --no-color >> /var/log/evernode-health.log
 
-### Use Cases
+# Skip account checks for faster execution
+sudo ./evernode_health_check.sh --cron --skip-accounts
+
+# Combine multiple flags
+sudo ./evernode_health_check.sh --cron --no-color --skip-accounts
+```
+
+**Cron Mode Auto-Detection:**
+- Domain name from `/etc/sashimono/reputationd/reputationd.cfg`
+- Instance count from Docker containers or `evernode status`
+- Host account from `/etc/sashimono/mb-xrpl/mb-xrpl.cfg`
+- Reputation account from `/etc/sashimono/reputationd/reputationd.cfg`
+- Gracefully skips checks if auto-detection fails
+
+### Command-Line Options
+
+```
+--cron, --silent    Run in non-interactive mode (no prompts, auto-detect all values)
+--no-color          Disable color output (useful for log files)
+--skip-accounts     Skip XRPL account balance checks
+--skip-logs         Skip Evernode log analysis (saves ~1-2 minutes)
+--verbose           Show detailed debugging information
+--help, -h          Show this help message
+```
+
+### Examples
 
 #### Pre-Installation Check
 Run this script BEFORE installing Evernode to verify your system meets all requirements:
@@ -179,11 +235,23 @@ sudo ./evernode_health_check.sh
 ```
 Review the output for any RED (error) or YELLOW (warning) messages.
 
-#### Regular Monitoring
-Schedule periodic health checks:
+#### Regular Monitoring with Cron
+Schedule periodic health checks for automated monitoring:
+
+**Daily Health Check (2 AM):**
 ```bash
-# Add to crontab for weekly checks
-0 2 * * 0 /path/to/evernode_health_check.sh > /var/log/evernode-health.log 2>&1
+# Add to crontab: sudo crontab -e
+0 2 * * * /root/evernode-node-doctor/evernode_health_check.sh --cron --no-color >> /var/log/evernode-health.log 2>&1
+```
+
+**Hourly Quick Check (skip accounts for speed):**
+```bash
+0 * * * * /root/evernode-node-doctor/evernode_health_check.sh --cron --skip-accounts --no-color >> /var/log/evernode-hourly.log 2>&1
+```
+
+**Weekly Full Audit (with log rotation):**
+```bash
+0 3 * * 0 /root/evernode-node-doctor/evernode_health_check.sh --cron --no-color > /var/log/evernode-weekly-$(date +\%Y\%m\%d).log 2>&1
 ```
 
 ## Requirements
@@ -198,12 +266,90 @@ Schedule periodic health checks:
 - `jq` - JSON parsing for XRPL API responses
 - `bc` - Decimal calculations
 
-### Optional Tools
+### Optional Tools (Enhanced Features)
 - `docker` - Container status checking
 - `fail2ban` - Security monitoring
 - `netstat` or `ss` - Port listening analysis
+- `websocat` - WebSocket testing (for Xahau WSS health check)
 
 **Note:** The script will attempt to install missing dependencies automatically.
+
+## Port Usage Analysis (New Feature)
+
+The enhanced port analysis provides a comprehensive view of your port configuration:
+
+### Example Output:
+```
+=== Port Usage Analysis ===
+Analyzing which ports are open in firewall vs actually listening...
+
+Port Status Analysis:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Port     Firewall     Listening    Purpose
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+80       ALLOW        NO           HTTP: Let's Encrypt validation, HTTP-to-HTTPS redirect
+  ⚠ SECURITY WARNING: Port open in firewall but nothing listening
+443      ALLOW        YES          HTTPS: SSL/TLS termination (reverse proxy) (nginx)
+22861    ALLOW        YES          Evernode User Port: WebSocket connections from tenants (docker)
+26201    ALLOW        YES          Evernode Peer Port: Sashimono peer-to-peer communication (docker)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+WARNING: 1 port(s) are open in firewall but not in use
+Recommendation: Either start the required service or close the port with: sudo ufw delete allow <port>
+```
+
+### What It Tells You:
+- **Port open but not listening (Evernode ports 22861+, 26201+, 36525+, 39064+)**: **This is EXPECTED BEHAVIOR** - these ports are pre-configured and services bind dynamically when instances are leased
+- **Port open but not listening (ports 80/443)**: May indicate reverse proxy not running - start service or close port
+- **Port listening with firewall deny**: Service is running but blocked - add firewall rule
+- **Port listening with firewall allow**: Correct configuration ✓
+
+### Important Note:
+Evernode ports are designed to be open in the firewall even when not actively listening. Services bind to these ports dynamically when tenant instances are leased. This is normal and expected behavior.
+
+## Xahau WSS Health Check (New Feature)
+
+The script now tests your connection to the Xahau network:
+
+### What It Checks:
+- Xahau node connectivity (WebSocket and HTTPS API)
+- Node version and build information
+- Ledger synchronization status
+- Server state (full, validating, proposing, syncing)
+
+### Example Output:
+```
+=== Xahau WSS Connection Health Check ===
+Configured Xahau WSS Endpoint: wss://xahau.network
+Testing WebSocket connection with websocat...
+SUCCESS: WSS connection to Xahau node is healthy
+  Xahau Version: 2024.11.19+619
+  Ledger Range: 1000000-1234567
+  Server State: full
+SUCCESS: Xahau node is fully synced
+```
+
+### Installation of websocat (Recommended):
+```bash
+# Get the latest version dynamically
+LATEST_VERSION=$(curl -s https://api.github.com/repos/vi/websocat/releases/latest | jq -r .tag_name)
+
+# Download pre-compiled binary from GitHub
+sudo curl -L "https://github.com/vi/websocat/releases/download/${LATEST_VERSION}/websocat.x86_64-unknown-linux-musl" -o /usr/local/bin/websocat
+
+# Make it executable
+sudo chmod +x /usr/local/bin/websocat
+
+# Verify installation
+websocat --version
+```
+
+**Or use the simplified one-liner:**
+```bash
+sudo curl -L "https://github.com/vi/websocat/releases/latest/download/websocat.x86_64-unknown-linux-musl" -o /usr/local/bin/websocat && sudo chmod +x /usr/local/bin/websocat
+```
+
+**Note:** Websocat is not available in standard apt repositories. If websocat is not installed, the script automatically falls back to HTTPS API testing, which provides the same information.
 
 ## Complete Validation Workflow
 
@@ -211,7 +357,7 @@ The script performs checks in the following order:
 
 ### Phase 1: Prerequisites & Dependencies
 1. Root/sudo privilege verification
-2. Automatic installation of missing dependencies (nmap, dig, curl, ufw, openssl, jq, docker.io)
+2. Automatic installation of missing dependencies
 
 ### Phase 2: System Requirements (CRITICAL)
 3. CPU core count validation (minimum 4 cores)
@@ -247,68 +393,58 @@ The script performs checks in the following order:
 25. Vulnerable service detection (Telnet, FTP, RDP, VNC)
 
 ### Phase 7: Network Configuration
-26. Domain name input and DNS resolution
+26. Domain name input and DNS resolution (auto-detected in cron mode)
 27. Public IP detection (gateway)
 28. DNS-to-Gateway IP comparison
 29. LAN IP detection
 30. DNS mismatch identification
 
-### Phase 8: Port Configuration
-31. Instance count input and validation
+### Phase 8: Port Configuration (🆕 ENHANCED)
+31. Instance count input and validation (auto-detected in cron mode)
 32. Required ports calculation (user, peer, TCP, UDP, HTTP/HTTPS)
-33. Nmap port scanning (domain)
-34. Nmap port scanning (LAN IP)
+33. **Port usage analysis** (firewall vs listening status)
+34. **Port purpose documentation** (what each port does)
+35. **Security warnings** (open but unused ports)
+36. Nmap port scanning (domain and LAN)
 
 ### Phase 9: Firewall Configuration
-35. UFW active status verification
-36. UFW rule enumeration
-37. Required port coverage analysis
-38. Missing firewall rules identification
+37. UFW active status verification
+38. UFW rule enumeration
+39. Required port coverage analysis
+40. Missing firewall rules identification
 
 ### Phase 10: SSL/TLS
-39. SSL certificate retrieval
-40. Certificate information display
-41. Expiration date validation
-42. Advance expiration warnings
+41. SSL certificate retrieval
+42. Certificate information display
+43. Expiration date validation
+44. Advance expiration warnings
 
 ### Phase 11: Evernode Status
-43. Host status retrieval via Evernode CLI
-44. Registration status display
+45. Host status retrieval via Evernode CLI
+46. Registration status display
 
-### Phase 12: Account Balances (CRITICAL)
-45. Host account balance check (XAH)
-46. Host account EVR trust line detection
-47. Host account EVR balance validation
-48. Reputation account balance check (XAH)
-49. Reputation account EVR balance validation
-50. Threshold validation (50 XAH/EVR minimum recommended)
+### Phase 12: Xahau Connection (🆕 NEW)
+47. Xahau WSS endpoint auto-detection
+48. WebSocket connection test (using websocat)
+49. Xahau node version and sync status
+50. HTTPS API fallback if needed
 
-### Phase 13: Additional Security
-51. fail2ban installation and status check
+### Phase 13: Account Balances (CRITICAL)
+51. Host account balance check (XAH)
+52. Host account EVR trust line detection
+53. Host account EVR balance validation
+54. Reputation account balance check (XAH)
+55. Reputation account EVR balance validation
+56. Threshold validation (50 XAH/EVR minimum recommended)
 
-### Phase 14: Final Report
-52. Overall health status summary
-53. Error count reporting
-54. Pass/fail determination
-55. Exit with appropriate code (0=success, 1=errors detected)
+### Phase 14: Additional Security
+57. fail2ban installation and status check
 
-## XRPL Account Balance Checking
-
-The script now includes the ability to verify your Evernode host and reputation account balances:
-
-- **XAH Balance**: Queries the XRPL network for native XAH balance
-- **EVR Balance**: Checks for EVR trust lines and balances
-- **Minimum Thresholds**: Warns if balances are below 50 XAH/EVR
-- **API Source**: Uses public XRPL cluster API for reliable data
-
-### Example Account Check Output
-```
-Checking balance for Host Account: rXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
-  XAH Balance: 125.50 XAH
-  SUCCESS: Host Account has sufficient XAH balance (125.50 XAH)
-  EVR Balance: 75.25 EVR
-  SUCCESS: Host Account has sufficient EVR balance (75.25 EVR)
-```
+### Phase 15: Final Report
+58. Overall health status summary
+59. Error count reporting
+60. Pass/fail determination
+61. Exit with appropriate code (0=success, 1=errors detected)
 
 ## Output Color Coding
 
@@ -331,12 +467,14 @@ Checking balance for Host Account: rXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
 - ✓ UFW properly configured
 - ✓ Sufficient account balances
 - ✓ Valid SSL certificate
+- ✓ Xahau node connection healthy
 
 ### Warnings (YELLOW)
 - ⚠ Suboptimal configurations that should be addressed
 - ⚠ Non-critical issues that won't prevent operation
 - ⚠ Recommendations for improved security/performance
 - ⚠ Account balances below recommended thresholds
+- ⚠ Ports open in firewall but not in use (security risk)
 
 ### Errors (RED)
 - ✗ Critical requirements not met
@@ -394,44 +532,19 @@ docker start <container_name>
 docker logs <container_name>
 ```
 
-### Evernode Installation Issues
-
-**"Evernode CLI is not installed"**
-- Follow the official Evernode installation guide
-- Visit: https://github.com/EvernodeXRPL/evernode-host
-
-**"Evernode service is not running"**
-```bash
-# Check service status
-systemctl status evernode*
-
-# Start the service
-sudo systemctl start <evernode_service_name>
-```
-
-### Network Issues
-
-**"Failed to resolve domain"**
-- Verify your domain DNS records are configured
-- Check DNS propagation: `dig +short yourdomain.com`
-- Wait for DNS propagation (can take up to 48 hours)
-
-**"DNS public IP mismatch"**
-- Update your DNS A record to point to your server's public IP
-- If behind NAT, configure port forwarding properly
-- Verify with: `curl -s https://ipinfo.io/ip`
-
-**"High latency"**
-- Check your network connection
-- Consider a different hosting provider with better connectivity
-- Run traceroute to identify network bottlenecks
-
-**"Unable to ping"**
-- Check firewall rules (ICMP may be blocked)
-- Verify internet connectivity
-- Check if destination host is reachable
-
 ### Port & Firewall Issues
+
+**"Port open in firewall but nothing listening" (NEW WARNING)**
+This is a security issue. Either:
+1. Start the service that should be using the port:
+   ```bash
+   # For example, if nginx should be listening on port 80:
+   sudo systemctl start nginx
+   ```
+2. Or close the unused port:
+   ```bash
+   sudo ufw delete allow <port>
+   ```
 
 **"UFW is inactive"**
 ```bash
@@ -456,21 +569,22 @@ sudo ufw allow 26201:26205/tcp
 - Check router/firewall port forwarding
 - Verify services are binding to correct interfaces
 
-### SSL Certificate Issues
+### Xahau Connection Issues (NEW)
 
-**"Failed to retrieve SSL certificate"**
-- Ensure your domain is accessible via HTTPS
-- Check if port 443 is open and forwarded
-- Verify SSL certificate is properly installed
-- Use Let's Encrypt for free certificates
+**"Failed to connect to Xahau endpoint"**
+- Check internet connectivity: `ping 8.8.8.8`
+- Verify the endpoint in config: `cat /etc/sashimono/mb-xrpl/mb-xrpl.cfg | jq .xrpl.rippledServer`
+- Try the public endpoint manually: `curl -X POST https://xahau.network -d '{"method":"server_info","params":[{}]}'`
+- Check if firewall is blocking outbound connections
 
-**"SSL certificate has expired"**
-- Renew your SSL certificate immediately
-- Configure automatic renewal (e.g., certbot)
+**"Xahau node state: syncing"**
+- Node is still synchronizing with the network
+- Wait for node to reach "full" state
+- This is normal for new nodes or after downtime
 
-**"SSL certificate expires soon"**
-- Renew certificate before expiration
-- Set up monitoring/alerts for expiration
+**"websocat not installed"**
+- Install it for better WSS testing: `sudo apt-get install websocat`
+- The script will use HTTPS API fallback automatically
 
 ### Account Balance Issues
 
@@ -512,6 +626,7 @@ sudo ./evernode_health_check.sh
 3. **Verify basics first** - Internet connection, DNS, firewall
 4. **One issue at a time** - Fix critical errors before warnings
 5. **Rerun after fixes** - Verify each fix by running the script again
+6. **Use cron mode for monitoring** - Automate regular checks
 
 ## Security Best Practices
 
@@ -548,6 +663,16 @@ sudo ufw allow 39064:39100/udp
 
 # Enable firewall
 sudo ufw enable
+```
+
+### Port Management
+Use the port usage analysis feature to identify and close unused open ports:
+```bash
+# Run the health check to see which ports are open but unused
+sudo ./evernode_health_check.sh
+
+# Close any unused ports
+sudo ufw delete allow <port>
 ```
 
 ### Fail2ban Setup
@@ -588,11 +713,11 @@ sudo systemctl enable certbot.timer
 # Schedule regular health checks
 sudo crontab -e
 
-# Add weekly check (Sundays at 2 AM)
-0 2 * * 0 /path/to/evernode_health_check.sh > /var/log/evernode-health.log 2>&1
+# Add daily check (2 AM)
+0 2 * * * /root/evernode-node-doctor/evernode_health_check.sh --cron --no-color >> /var/log/evernode-health.log 2>&1
 
 # Add monthly full audit
-0 3 1 * * /path/to/evernode_health_check.sh > /var/log/evernode-audit-$(date +\%Y\%m).log 2>&1
+0 3 1 * * /root/evernode-node-doctor/evernode_health_check.sh --cron > /var/log/evernode-audit-$(date +\%Y\%m).log 2>&1
 ```
 
 ## Contributing
@@ -610,7 +735,23 @@ For Evernode-related questions, visit the official Evernode documentation and co
 
 ## Changelog
 
-### Version 2.0 (Current)
+### Version 2.6 (Current)
+- **Added Evernode Log Analysis**: Analyzes `evernode log` output for errors and failures
+- **Added --skip-logs Flag**: Skip intensive log generation (saves 1-2 minutes)
+- **Added Early Warning System**: 5-second countdown before starting checks
+- **Added Options Display**: Shows available flags at script start
+- **Added ASCII Art Banner**: Professional "EVERNODE NODE DOCTOR" header
+
+### Version 2.5
+- **Added Cron Mode**: Fully automated non-interactive mode with complete auto-detection
+- **Added Port Usage Analysis**: Shows firewall vs listening status with security warnings
+- **Added Port Purpose Documentation**: Clear explanations for each port's purpose
+- **Added Xahau WSS Health Check**: Test WebSocket connection using websocat (safe, no npm)
+- **Added Command-Line Arguments**: --cron, --no-color, --skip-accounts, --verbose, --help
+- **Enhanced Auto-Detection**: Domain, instance count, and accounts from config files
+- **Improved Logging**: Better suited for log files with --no-color option
+
+### Version 2.0
 - Complete rewrite with comprehensive validation
 - Added system requirements checking (CPU, RAM, disk)
 - Added Docker infrastructure validation

@@ -7,11 +7,98 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
+# Global mode flags
+CRON_MODE=0
+NO_COLOR=0
+SKIP_ACCOUNTS=0
+SKIP_LOGS=0
+VERBOSE=0
+
 # Global error flag and tracking arrays
 HAS_ERRORS=0
 declare -a SUCCESS_MESSAGES=()
 declare -a WARNING_MESSAGES=()
 declare -a ERROR_MESSAGES=()
+
+# Parse command-line arguments
+parse_arguments() {
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --cron|--silent)
+                CRON_MODE=1
+                shift
+                ;;
+            --no-color)
+                NO_COLOR=1
+                shift
+                ;;
+            --skip-accounts)
+                SKIP_ACCOUNTS=1
+                shift
+                ;;
+            --skip-logs)
+                SKIP_LOGS=1
+                shift
+                ;;
+            --verbose)
+                VERBOSE=1
+                shift
+                ;;
+            --help|-h)
+                show_help
+                exit 0
+                ;;
+            *)
+                echo "Unknown option: $1"
+                echo "Use --help for usage information"
+                exit 1
+                ;;
+        esac
+    done
+    
+    # If NO_COLOR is set, disable color codes
+    if [ $NO_COLOR -eq 1 ]; then
+        RED=''
+        GREEN=''
+        YELLOW=''
+        BLUE=''
+        NC=''
+    fi
+}
+
+# Show help message
+show_help() {
+    cat << EOF
+Evernode Node Doctor - Health Check Script
+
+Usage: $0 [OPTIONS]
+
+Options:
+  --cron, --silent    Run in non-interactive mode (no prompts, auto-detect all values)
+  --no-color          Disable color output (useful for log files)
+  --skip-accounts     Skip XRPL account balance checks
+  --skip-logs         Skip Evernode log analysis (saves ~1-2 minutes)
+  --verbose           Show detailed debugging information
+  --help, -h          Show this help message
+
+Examples:
+  # Interactive mode (default)
+  sudo $0
+
+  # Cron mode for automated monitoring
+  sudo $0 --cron
+
+  # Cron mode with output to log file
+  sudo $0 --cron --no-color >> /var/log/evernode-health.log
+
+  # Skip log analysis for faster execution
+  sudo $0 --skip-logs
+
+  # Skip both accounts and logs for fastest execution
+  sudo $0 --cron --skip-accounts --skip-logs
+
+EOF
+}
 
 # Function to print colored output
 print_color() {
@@ -499,8 +586,101 @@ check_evernode_host_status() {
     fi
 }
 
+# Function to check Xahau WSS connection
+check_xahau_wss_connection() {
+    print_color "$YELLOW" "\n=== Xahau WSS Connection Health Check ==="
+    
+    # Extract WSS endpoint from config
+    local wss_endpoint=""
+    if [ -f "/etc/sashimono/mb-xrpl/mb-xrpl.cfg" ]; then
+        wss_endpoint=$(jq -r '.xrpl.rippledServer // empty' /etc/sashimono/mb-xrpl/mb-xrpl.cfg 2>/dev/null)
+    fi
+    
+    if [ -z "$wss_endpoint" ]; then
+        log_warning "Xahau WSS endpoint not found in config, skipping WSS health check"
+        return 0
+    fi
+    
+    echo "Configured Xahau WSS Endpoint: $wss_endpoint"
+    
+    # Method 1: Try websocat (preferred - safe, no npm conflicts)
+    if check_command "websocat"; then
+        echo "Testing WebSocket connection with websocat..."
+        wss_response=$(echo '{"command":"server_info"}' | timeout 10 websocat -n1 "$wss_endpoint" 2>&1)
+        
+        if [ $? -eq 0 ] && echo "$wss_response" | jq -e '.result' &>/dev/null; then
+            log_success "WSS connection to Xahau node is healthy"
+            
+            # Parse server info
+            build_version=$(echo "$wss_response" | jq -r '.result.info.build_version // "unknown"' 2>/dev/null)
+            complete_ledgers=$(echo "$wss_response" | jq -r '.result.info.complete_ledgers // "unknown"' 2>/dev/null)
+            server_state=$(echo "$wss_response" | jq -r '.result.info.server_state // "unknown"' 2>/dev/null)
+            
+            echo "  Xahau Version: $build_version"
+            echo "  Ledger Range: $complete_ledgers"
+            echo "  Server State: $server_state"
+            
+            if [ "$server_state" == "full" ]; then
+                log_success "Xahau node is fully synced"
+            elif [ "$server_state" == "validating" ] || [ "$server_state" == "proposing" ]; then
+                log_success "Xahau node is active ($server_state)"
+            else
+                log_warning "Xahau node state: $server_state (may be syncing)"
+            fi
+            return 0
+        else
+            log_warning "WebSocket test failed, trying HTTPS API fallback..."
+        fi
+    else
+        log_info "websocat not installed, trying HTTPS API fallback..."
+        echo "Tip: Install websocat for better WSS testing: apt-get install websocat"
+    fi
+    
+    # Method 2: Fallback to HTTPS API (if WSS fails or websocat unavailable)
+    log_info "Testing with HTTPS API fallback..."
+    
+    # Convert wss:// to https:// for API testing
+    https_endpoint="${wss_endpoint//wss:/https:}"
+    
+    api_response=$(curl -s -X POST "$https_endpoint" \
+        -H "Content-Type: application/json" \
+        -d '{"method":"server_info","params":[{}]}' \
+        --connect-timeout 10 --max-time 15 2>&1)
+    
+    if [ $? -eq 0 ] && echo "$api_response" | jq -e '.result' &>/dev/null; then
+        log_success "HTTPS API connection to Xahau node is healthy"
+        
+        build_version=$(echo "$api_response" | jq -r '.result.info.build_version // "unknown"' 2>/dev/null)
+        complete_ledgers=$(echo "$api_response" | jq -r '.result.info.complete_ledgers // "unknown"' 2>/dev/null)
+        server_state=$(echo "$api_response" | jq -r '.result.info.server_state // "unknown"' 2>/dev/null)
+        
+        echo "  Xahau Version: $build_version"
+        echo "  Ledger Range: $complete_ledgers"
+        echo "  Server State: $server_state"
+        
+        if [ "$server_state" == "full" ]; then
+            log_success "Xahau node is fully synced"
+        elif [ "$server_state" == "validating" ] || [ "$server_state" == "proposing" ]; then
+            log_success "Xahau node is active ($server_state)"
+        else
+            log_warning "Xahau node state: $server_state"
+        fi
+        return 0
+    else
+        log_error "Failed to connect to Xahau endpoint: $wss_endpoint"
+        echo "This may indicate network issues or Xahau node problems"
+        return 1
+    fi
+}
+
 # Function to check Evernode accounts
 check_evernode_accounts() {
+    # Skip account checks if --skip-accounts flag is set
+    if [ $SKIP_ACCOUNTS -eq 1 ]; then
+        log_info "Skipping account balance checks (--skip-accounts flag set)"
+        return 0
+    fi
+    
     print_color "$YELLOW" "\n=== Evernode Account Balance Check ==="
     
     # Check if jq is available for JSON parsing
@@ -557,34 +737,230 @@ check_evernode_accounts() {
         done
     fi
     
-    # Prompt for host account (with auto-detected default)
-    if [ -n "$auto_host_account" ]; then
-        echo "Auto-detected host account: $auto_host_account"
-        read -p "Press Enter to check this account, or enter a different address: " host_account
-        host_account=${host_account:-$auto_host_account}
+    # In CRON_MODE, use auto-detected accounts only
+    if [ $CRON_MODE -eq 1 ]; then
+        if [ -n "$auto_host_account" ]; then
+            echo "Using auto-detected host account: $auto_host_account"
+            check_xrpl_balance "$auto_host_account" "Host Account"
+        else
+            log_warning "Host account not auto-detected in cron mode, skipping host account check"
+        fi
+        
+        if [ -n "$auto_rep_account" ]; then
+            echo "Using auto-detected reputation account: $auto_rep_account"
+            check_xrpl_balance "$auto_rep_account" "Reputation Account"
+        else
+            log_warning "Reputation account not auto-detected in cron mode, skipping reputation account check"
+        fi
     else
-        read -p "Enter your Evernode host account address (or press Enter to skip): " host_account
+        # Interactive mode: Prompt for host account (with auto-detected default)
+        if [ -n "$auto_host_account" ]; then
+            echo "Auto-detected host account: $auto_host_account"
+            read -p "Press Enter to check this account, or enter a different address: " host_account
+            host_account=${host_account:-$auto_host_account}
+        else
+            read -p "Enter your Evernode host account address (or press Enter to skip): " host_account
+        fi
+        
+        if [ -n "$host_account" ]; then
+            check_xrpl_balance "$host_account" "Host Account"
+        else
+            log_warning "Host account check skipped (RECOMMENDED to check)"
+        fi
+        
+        # Prompt for reputation account (with auto-detected default)
+        if [ -n "$auto_rep_account" ]; then
+            echo "Auto-detected reputation account: $auto_rep_account"
+            read -p "Press Enter to check this account, or enter a different address: " reputation_account
+            reputation_account=${reputation_account:-$auto_rep_account}
+        else
+            read -p "Enter your Evernode reputation account address (or press Enter to skip): " reputation_account
+        fi
+        
+        if [ -n "$reputation_account" ]; then
+            check_xrpl_balance "$reputation_account" "Reputation Account"
+        else
+            log_warning "Reputation account check skipped (RECOMMENDED to check)"
+        fi
+    fi
+}
+
+# Function to check Evernode logs for errors
+check_evernode_logs() {
+    # Skip log analysis if --skip-logs flag is set
+    if [ $SKIP_LOGS -eq 1 ]; then
+        log_info "Skipping Evernode log analysis (--skip-logs flag set)"
+        return 0
     fi
     
-    if [ -n "$host_account" ]; then
-        check_xrpl_balance "$host_account" "Host Account"
-    else
-        log_warning "Host account check skipped (RECOMMENDED to check)"
+    print_color "$YELLOW" "\n=== Evernode Log Analysis ==="
+    
+    # Check if evernode CLI is available
+    if ! check_command "evernode"; then
+        log_warning "Evernode CLI not available. Skipping log analysis"
+        return 1
     fi
     
-    # Prompt for reputation account (with auto-detected default)
-    if [ -n "$auto_rep_account" ]; then
-        echo "Auto-detected reputation account: $auto_rep_account"
-        read -p "Press Enter to check this account, or enter a different address: " reputation_account
-        reputation_account=${reputation_account:-$auto_rep_account}
-    else
-        read -p "Enter your Evernode reputation account address (or press Enter to skip): " reputation_account
+    print_color "$BLUE" "Generating Evernode logs (this takes ~1-2 minutes, please wait)..."
+    
+    # Generate log and capture output
+    log_output=$(evernode log 2>&1)
+    
+    # Extract log filename from output
+    log_file=$(echo "$log_output" | grep -oP '/tmp/.*\.log' | head -1)
+    
+    # Check if log file was created
+    if [ -z "$log_file" ] || [ ! -f "$log_file" ]; then
+        log_warning "Could not generate Evernode log file"
+        echo "Evernode log command output:"
+        echo "$log_output"
+        return 1
     fi
     
-    if [ -n "$reputation_account" ]; then
-        check_xrpl_balance "$reputation_account" "Reputation Account"
+    echo "Log file generated: $log_file"
+    print_color "$BLUE" "Analyzing logs for errors and failures..."
+    
+    # Search for error patterns (case-insensitive)
+    # Filter out common false positives like "0 errors" or "no error"
+    errors=$(grep -iE "(error|fail|exception|critical|fatal)" "$log_file" | \
+             grep -viE "(0 errors|no error|successfully|success)" | \
+             head -20)
+    
+    # Display results
+    if [ -n "$errors" ]; then
+        error_count=$(echo "$errors" | wc -l)
+        log_warning "Found $error_count issue(s) in Evernode logs (showing first 20):"
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        print_color "$RED" "$errors"
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        echo "Full log available at: $log_file"
+        echo "To view full log: cat $log_file"
     else
-        log_warning "Reputation account check skipped (RECOMMENDED to check)"
+        log_success "No errors found in Evernode logs"
+        echo "Log file: $log_file"
+    fi
+}
+
+# Function to get port purpose/description
+get_port_purpose() {
+    local port=$1
+    case $port in
+        80)
+            echo "HTTP: Let's Encrypt validation, HTTP-to-HTTPS redirect"
+            ;;
+        443)
+            echo "HTTPS: SSL/TLS termination (reverse proxy)"
+            ;;
+        22861|22862|22863|22864|22865|22866|22867|22868|22869|22870)
+            echo "Evernode User Port: WebSocket connections from tenants"
+            ;;
+        26201|26202|26203|26204|26205|26206|26207|26208|26209|26210)
+            echo "Evernode Peer Port: Sashimono peer-to-peer communication"
+            ;;
+        36525|36526|36527|36528|36529|36530|36531|36532|36533|36534|36535|36536|36537|36538|36539|36540)
+            echo "Evernode TCP Port: Tenant instance TCP communication"
+            ;;
+        39064|39065|39066|39067|39068|39069|39070|39071|39072|39073|39074|39075|39076|39077|39078|39079|39080)
+            echo "Evernode UDP Port: Tenant instance UDP communication"
+            ;;
+        *)
+            echo "Unknown port"
+            ;;
+    esac
+}
+
+# Function to analyze port usage (firewall vs actual listeners)
+analyze_port_usage() {
+    local required_ports=("$@")
+    
+    print_color "$YELLOW" "\n=== Port Usage Analysis ==="
+    echo "Analyzing which ports are open in firewall vs actually listening..."
+    
+    # Get currently listening ports
+    if ! check_command "netstat"; then
+        if ! check_command "ss"; then
+            log_error "Neither netstat nor ss is available for port checking"
+            return 1
+        fi
+        listening_ports=$(ss -tuln | grep LISTEN | awk '{print $5}' | sed 's/.*://' | sort -u)
+    else
+        listening_ports=$(netstat -tuln | grep LISTEN | awk '{print $4}' | sed 's/.*://' | sort -u)
+    fi
+    
+    # Get UFW allowed ports
+    if check_command "ufw"; then
+        ufw_status=$(sudo ufw status 2>/dev/null)
+        if [ $? -eq 0 ] && [[ ! $ufw_status == *"inactive"* ]]; then
+            echo -e "\nPort Status Analysis:"
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            printf "%-8s %-12s %-12s %-50s\n" "Port" "Firewall" "Listening" "Purpose"
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            
+            local security_issues=0
+            
+            for port in "${required_ports[@]}"; do
+                # Check if port is allowed in UFW
+                local firewall_status="DENY"
+                if echo "$ufw_status" | grep -q "$port"; then
+                    firewall_status="ALLOW"
+                fi
+                
+                # Check if port is actually listening
+                local listening_status="NO"
+                local listening_process=""
+                if echo "$listening_ports" | grep -q "^${port}$"; then
+                    listening_status="YES"
+                    # Try to get the process name
+                    if check_command "netstat"; then
+                        listening_process=$(sudo netstat -tulnp 2>/dev/null | grep ":${port} " | awk '{print $7}' | cut -d'/' -f2 | head -1)
+                    elif check_command "ss"; then
+                        listening_process=$(sudo ss -tulnp 2>/dev/null | grep ":${port} " | grep -oP 'users:\(\(".*?"\)' | sed 's/users:(("//' | sed 's/".*//' | head -1)
+                    fi
+                fi
+                
+                # Get port purpose
+                local purpose=$(get_port_purpose "$port")
+                
+                # Determine status color and message
+                local status_msg=""
+                if [ "$firewall_status" == "ALLOW" ] && [ "$listening_status" == "NO" ]; then
+                    status_msg="⚠ SECURITY WARNING: Port open in firewall but nothing listening"
+                    security_issues=$((security_issues + 1))
+                    print_color "$YELLOW" "$(printf '%-8s %-12s %-12s %s' "$port" "$firewall_status" "$listening_status" "$purpose")"
+                    echo "  $status_msg"
+                elif [ "$firewall_status" == "ALLOW" ] && [ "$listening_status" == "YES" ]; then
+                    if [ -n "$listening_process" ]; then
+                        print_color "$GREEN" "$(printf '%-8s %-12s %-12s %s (%s)' "$port" "$firewall_status" "$listening_status" "$purpose" "$listening_process")"
+                    else
+                        print_color "$GREEN" "$(printf '%-8s %-12s %-12s %s' "$port" "$firewall_status" "$listening_status" "$purpose")"
+                    fi
+                elif [ "$firewall_status" == "DENY" ] && [ "$listening_status" == "YES" ]; then
+                    status_msg="⚠ Service running but blocked by firewall"
+                    print_color "$YELLOW" "$(printf '%-8s %-12s %-12s %s' "$port" "$firewall_status" "$listening_status" "$purpose")"
+                    echo "  $status_msg"
+                else
+                    # Port not in firewall and not listening - normal
+                    printf '%-8s %-12s %-12s %s\n' "$port" "$firewall_status" "$listening_status" "$purpose"
+                fi
+            done
+            
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            
+            # Summary
+            if [ $security_issues -gt 0 ]; then
+                log_warning "$security_issues port(s) are open in firewall but not in use"
+                echo ""
+                echo "NOTE: For Evernode ports (22861+, 26201+, 36525+, 39064+), this is EXPECTED BEHAVIOR."
+                echo "      These ports are pre-configured and will be used when instances are leased to tenants."
+                echo "      Services bind to these ports dynamically when needed."
+                echo ""
+                echo "For ports 80/443 (HTTP/HTTPS):"
+                echo "  - If you use a reverse proxy (nginx/caddy), ensure it's running"
+                echo "  - If you don't need them, close with: sudo ufw delete allow <port>"
+            else
+                log_success "All open ports have services listening"
+            fi
+        fi
     fi
 }
 
@@ -670,6 +1046,18 @@ check_ssl_certificate() {
         return 1
     fi
     
+    # Check if port 443 is listening first
+    local port_443_listening=0
+    if command -v netstat &>/dev/null; then
+        if netstat -tuln 2>/dev/null | grep -q ":443 "; then
+            port_443_listening=1
+        fi
+    elif command -v ss &>/dev/null; then
+        if ss -tuln 2>/dev/null | grep -q ":443 "; then
+            port_443_listening=1
+        fi
+    fi
+    
     # First, check HTTPS accessibility
     http_code=$(curl -s -o /dev/null -w "%{http_code}" "https://${domain}" --connect-timeout 5 --max-time 10 2>/dev/null)
     
@@ -714,9 +1102,17 @@ check_ssl_certificate() {
             log_info "SSL is working through your reverse proxy (nginx)"
         fi
     else
-        log_warning "Unable to verify HTTPS accessibility for $domain (HTTP code: ${http_code:-N/A})"
-        echo "Note: This is normal if SSL is handled by a reverse proxy and routing differs internally"
-        echo "Verify SSL externally: curl -I https://$domain"
+        # HTTP code 000 or connection failed
+        if [ "$port_443_listening" -eq 0 ]; then
+            log_info "No web service detected on port 443 (HTTPS)"
+            echo "Note: This is expected if you don't use a reverse proxy (nginx/caddy)."
+            echo "      Evernode itself doesn't require HTTPS - tenant access is via dedicated ports."
+            echo "      Only set up HTTPS if you want a web interface or Let's Encrypt certificates."
+        else
+            log_warning "Port 443 is listening but domain is not accessible (HTTP code: ${http_code:-N/A})"
+            echo "Possible causes: Firewall blocking, DNS issues, or reverse proxy misconfiguration"
+            echo "Verify SSL externally: curl -I https://$domain"
+        fi
     fi
 }
 
@@ -732,6 +1128,11 @@ generate_report() {
     echo "Domain: $domain"
     echo "LAN IP: $lan_ip"
     echo "Required Ports: ${required_ports[*]}"
+    
+    # Analyze port usage (firewall vs actual listeners) - NEW FEATURE
+    if [ ${#required_ports[@]} -gt 0 ]; then
+        analyze_port_usage "${required_ports[@]}"
+    fi
     
     # Only run nmap if we have ports to scan
     if [ ${#required_ports[@]} -gt 0 ]; then
@@ -754,14 +1155,78 @@ generate_report() {
 
 # Main script execution
 main() {
-    print_color "$BLUE" "====================================="
-    print_color "$BLUE" "Evernode Node Doctor - Health Check"
-    print_color "$BLUE" "====================================="
+    # Parse command-line arguments first
+    parse_arguments "$@"
+    
+    # Display ASCII art banner
     echo ""
+    print_color "$YELLOW" "
+  ███████╗██╗   ██╗███████╗██████╗ ███╗   ██╗ ██████╗ ██████╗ ███████╗
+  ██╔════╝██║   ██║██╔════╝██╔══██╗████╗  ██║██╔═══██╗██╔══██╗██╔════╝
+  █████╗  ██║   ██║█████╗  ██████╔╝██╔██╗ ██║██║   ██║██║  ██║█████╗  
+  ██╔══╝  ╚██╗ ██╔╝██╔══╝  ██╔══██╗██║╚██╗██║██║   ██║██║  ██║██╔══╝  
+  ███████╗ ╚████╔╝ ███████╗██║  ██║██║ ╚████║╚██████╔╝██████╔╝███████╗
+  ╚══════╝  ╚═══╝  ╚══════╝╚═╝  ╚═╝╚═╝  ╚═══╝ ╚═════╝ ╚═════╝ ╚══════╝"
+    print_color "$BLUE" "
+         ███╗   ██╗ ██████╗ ██████╗ ███████╗
+         ████╗  ██║██╔═══██╗██╔══██╗██╔════╝
+         ██╔██╗ ██║██║   ██║██║  ██║█████╗  
+         ██║╚██╗██║██║   ██║██║  ██║██╔══╝  
+         ██║ ╚████║╚██████╔╝██████╔╝███████╗
+         ╚═╝  ╚═══╝ ╚═════╝ ╚═════╝ ╚══════╝"
+    print_color "$GREEN" "
+    ██████╗  ██████╗  ██████╗████████╗ ██████╗ ██████╗ 
+    ██╔══██╗██╔═══██╗██╔════╝╚══██╔══╝██╔═══██╗██╔══██╗
+    ██║  ██║██║   ██║██║        ██║   ██║   ██║██████╔╝
+    ██║  ██║██║   ██║██║        ██║   ██║   ██║██╔══██╗
+    ██████╔╝╚██████╔╝╚██████╗   ██║   ╚██████╔╝██║  ██║
+    ╚═════╝  ╚═════╝  ╚═════╝   ╚═╝    ╚═════╝ ╚═╝  ╚═╝
+"
+    
+    print_color "$BLUE" "======================================"
+    print_color "$BLUE" "       Health Check v2.6"
+    if [ $CRON_MODE -eq 1 ]; then
+        print_color "$YELLOW" "          [CRON MODE]"
+    fi
+    print_color "$YELLOW" "====================================="
+    echo ""
+    
+    # Show available options (only in interactive mode)
+    if [ $CRON_MODE -eq 0 ]; then
+        print_color "$BLUE" "Available Options:"
+        echo "  --cron, --silent    Non-interactive mode (auto-detect everything)"
+        echo "  --no-color          Disable colors (for log files)"
+        echo "  --skip-accounts     Skip account balance checks"
+        echo "  --skip-logs         Skip log analysis (saves 1-2 minutes)"
+        echo "  --help, -h          Show full help"
+        echo ""
+        print_color "$BLUE" "Quick Examples:"
+        echo "  sudo $0 --skip-logs                    (skip intensive log check)"
+        echo "  sudo $0 --cron --no-color >> log.txt   (automated monitoring)"
+        echo ""
+    fi
     
     if [ "$EUID" -ne 0 ]; then
         log_error "Please run this script as root or with sudo"
         exit 1
+    fi
+    
+    # Show log analysis notice (only in interactive mode, not in cron)
+    if [ $CRON_MODE -eq 0 ] && [ $SKIP_LOGS -eq 0 ]; then
+        print_color "$YELLOW" "
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  ℹ️  NOTE: This script will analyze Evernode logs at the end.
+  
+  Log generation is intensive and takes ~1-2 minutes.
+  
+  To skip log analysis, press Ctrl+C now and restart with:
+  sudo ./evernode_health_check.sh --skip-logs
+  
+  Starting in 5 seconds...
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+"
+        sleep 5
+        echo ""
     fi
 
     # Install dependencies
@@ -795,19 +1260,45 @@ main() {
         auto_domain=$(jq -r '.contractInstance.domain // empty' /etc/sashimono/reputationd/reputationd.cfg 2>/dev/null)
     fi
     
-    # Prompt with auto-detected domain as default
-    if [ -n "$auto_domain" ]; then
-        echo "Auto-detected domain: $auto_domain"
-        read -p "Press Enter to use this domain, or enter a different one: " domain_name
-        domain_name=${domain_name:-$auto_domain}
+    # In CRON_MODE, use auto-detected domain or skip
+    if [ $CRON_MODE -eq 1 ]; then
+        if [ -n "$auto_domain" ]; then
+            domain_name="$auto_domain"
+            echo "Using auto-detected domain: $domain_name"
+        else
+            log_warning "Domain not auto-detected in cron mode, skipping domain checks"
+            domain_name=""
+        fi
     else
-        read -p "Enter the domain name of your Evernode host: " domain_name
+        # Interactive mode: Prompt with auto-detected domain as default
+        if [ -n "$auto_domain" ]; then
+            echo "Auto-detected domain: $auto_domain"
+            read -p "Press Enter to use this domain, or enter a different one: " domain_name
+            domain_name=${domain_name:-$auto_domain}
+        else
+            read -p "Enter the domain name of your Evernode host: " domain_name
+        fi
+        
+        if [ -z "$domain_name" ]; then
+            log_error "Domain name cannot be empty"
+            exit 1
+        fi
     fi
     
+    # Skip domain checks if no domain in cron mode
     if [ -z "$domain_name" ]; then
-        log_error "Domain name cannot be empty"
-        exit 1
-    fi
+        log_info "Skipping domain-based checks"
+        gateway_ip=""
+        resolved_ip=""
+        lan_ip=$(ip -4 addr show 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | grep -v '127.0.0.1' | head -n 1)
+        if [ -z "$lan_ip" ]; then
+            log_error "Failed to determine LAN IP"
+        else
+            echo "LAN IP: $lan_ip"
+        fi
+        instance_count=1
+        required_ports=()
+    else
     
     if ! check_command "dig"; then
         log_error "dig command not found. Cannot resolve domain"
@@ -843,48 +1334,63 @@ main() {
         echo "LAN IP: $lan_ip"
     fi
 
-    # Instance count and port configuration
-    print_color "$YELLOW" "\n=== Instance Count Detection ==="
-    
-    # Try to auto-detect instance count from running containers
-    auto_instance_count=0
-    if check_command "docker" &>/dev/null; then
-        auto_instance_count=$(docker ps --filter "name=sashi" --format "{{.Names}}" 2>/dev/null | wc -l)
-    fi
-    
-    # Alternative: try to parse from evernode status
-    if [ "$auto_instance_count" -eq 0 ] && check_command "evernode" &>/dev/null; then
-        evernode_status_output=$(evernode status 2>/dev/null)
-        if [ -n "$evernode_status_output" ]; then
-            # Look for "Available Lease offers: X out of Y" pattern and extract Y (total instances)
-            # The \K in the regex discards everything before it, so we capture only Y
-            auto_instance_count=$(echo "$evernode_status_output" | grep -oP 'Available Lease offers: \d+ out of \K\d+' 2>/dev/null)
+        # Instance count and port configuration
+        print_color "$YELLOW" "\n=== Instance Count Detection ==="
+        
+        # Try to auto-detect instance count from running containers
+        auto_instance_count=0
+        if check_command "docker" &>/dev/null; then
+            auto_instance_count=$(docker ps --filter "name=sashi" --format "{{.Names}}" 2>/dev/null | wc -l)
         fi
-    fi
-    
-    # Prompt with auto-detected value as default
-    if [ "$auto_instance_count" -gt 0 ]; then
-        echo "Auto-detected $auto_instance_count Evernode instance(s)"
-        read -p "Press Enter to use this count, or enter a different number: " instance_count
-        instance_count=${instance_count:-$auto_instance_count}
-    else
-        read -p "How many Evernode instances do you have? " instance_count
-    fi
-    
-    if ! [[ "$instance_count" =~ ^[0-9]+$ ]] || [ "$instance_count" -lt 1 ]; then
-        log_error "Invalid instance count. Must be a positive number"
-        exit 1
-    fi
-    
-    echo "Using instance count: $instance_count"
+        
+        # Alternative: try to parse from evernode status
+        if [ "$auto_instance_count" -eq 0 ] && check_command "evernode" &>/dev/null; then
+            evernode_status_output=$(evernode status 2>/dev/null)
+            if [ -n "$evernode_status_output" ]; then
+                # Look for "Available Lease offers: X out of Y" pattern and extract Y (total instances)
+                # The \K in the regex discards everything before it, so we capture only Y
+                auto_instance_count=$(echo "$evernode_status_output" | grep -oP 'Available Lease offers: \d+ out of \K\d+' 2>/dev/null)
+            fi
+        fi
+        
+        # In CRON_MODE, use auto-detected value or default to 1
+        if [ $CRON_MODE -eq 1 ]; then
+            if [ "$auto_instance_count" -gt 0 ]; then
+                instance_count=$auto_instance_count
+                echo "Using auto-detected instance count: $instance_count"
+            else
+                instance_count=1
+                log_warning "Instance count not auto-detected, defaulting to 1"
+            fi
+        else
+            # Interactive mode: Prompt with auto-detected value as default
+            if [ "$auto_instance_count" -gt 0 ]; then
+                echo "Auto-detected $auto_instance_count Evernode instance(s)"
+                read -p "Press Enter to use this count, or enter a different number: " instance_count
+                instance_count=${instance_count:-$auto_instance_count}
+            else
+                read -p "How many Evernode instances do you have? " instance_count
+            fi
+            
+            if ! [[ "$instance_count" =~ ^[0-9]+$ ]] || [ "$instance_count" -lt 1 ]; then
+                log_error "Invalid instance count. Must be a positive number"
+                exit 1
+            fi
+        fi
+        
+        echo "Using instance count: $instance_count"
 
-    required_ports=($(calculate_required_ports "$instance_count"))
+        required_ports=($(calculate_required_ports "$instance_count"))
 
-    # Generate comprehensive report
-    generate_report "$domain_name" "$lan_ip" "${required_ports[@]}"
+        # Generate comprehensive report
+        generate_report "$domain_name" "$lan_ip" "${required_ports[@]}"
+    fi
     
     # Check Evernode host status
     check_evernode_host_status
+    
+    # Check Xahau WSS connection health
+    check_xahau_wss_connection
     
     # Check Evernode account balances (CRITICAL)
     check_evernode_accounts
@@ -897,6 +1403,9 @@ main() {
     else
         log_warning "Fail2ban is not active or not installed"
     fi
+    
+    # Check Evernode logs (intensive operation, runs last)
+    check_evernode_logs
     
     # Print summary report
     print_summary_report
