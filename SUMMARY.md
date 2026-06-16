@@ -1,27 +1,75 @@
-# Implementation Summary - Evernode Node Doctor v2.6
+# Implementation Summary - Evernode Node Doctor v3.0
 
-## ✅ Version 2.6 Updates - Successfully Implemented
+## ✅ Version 3.0 Updates - Successfully Implemented
 
-### 1. Strict Xahau Node State Validation ✓
+### 1. Command-Line Flags Now Apply (critical fix) ✓
 **What Changed:**
-- Previously accepted: `full`, `validating`, or `proposing`
-- Now requires: **`full` ONLY**
+- `main` was invoked without forwarding `"$@"`, so every flag
+  (`--cron`, `--no-color`, `--skip-accounts`, `--skip-logs`, `--help`)
+  was silently ignored on a normal run.
 
 **Implementation:**
-- Modified all server_state checks in `check_xahau_wss_connection` function
-- Changed from warnings to errors when state is not "full"
-- Updated validation in all three check methods (websocat, API v1, standard API)
+- Changed the final invocation from `main` to `main "$@"`.
 
 **Why:**
-- Ensures node is fully synchronized before accepting tenants
-- Prevents issues with partially synced nodes
-- Provides clearer error messages
+- Documented cron jobs were silently running in interactive mode.
+- `--help` now exits with usage instead of running a full check.
+
+### 2. JSON Output Mode (`--json`) ✓
+**New:**
+- Added `print_json_report` (built with `jq` for correct escaping).
+- `--json` implies `--cron` and `--no-color`, suppresses the banner.
+
+**Exit codes (JSON and normal runs):**
+- `0` clean, `1` errors, `2` passing-with-warnings.
+
+### 3. Balance Check Endpoint and EVR Fix ✓
+**What Changed:**
+- `check_xrpl_balance` now takes the JSON-RPC endpoint as an argument,
+  derived from the node's configured `rippledServer` (fallback to the
+  public Xahau RPC).
+- Removed a dead `evr_balance` assignment that shadowed the real EVR
+  trustline read; EVR is now read from `account_lines` by the canonical
+  Evernode issuer.
+- Added `actNotFound` handling, signed-balance normalisation, and
+  address-format validation.
+
+**Note:** the 50 XAH / 50 EVR figures are recommended operator buffers,
+explicitly not the protocol reserve minimum.
+
+### 4. Correct Xahau Sync States ✓
+**What Changed:**
+- `evaluate_server_state` accepts `full`, `proposing`, or `validating`
+  as healthy. Only `syncing`/`connected`/`tracking` error. Reverts the
+  over-strict v2.6 "full only" behaviour.
+
+### 5. Correct Port Maths ✓
+**What Changed:**
+- Fixed an off-by-one in `calculate_required_ports`.
+- Included the previously-dropped UDP port range.
+- `get_port_purpose` is now range-based (shared base-offset constants),
+  so >10 instances no longer report "Unknown port".
+
+### 6. Cron-Safe Dependencies and Hardening ✓
+**What Changed:**
+- `install_deps` installs only missing tools and never runs `apt-get`
+  in `--cron`/`--json` mode.
+- Added `set -uo pipefail`.
+- Added an MIT `LICENSE` file.
+
+---
+
+## ✅ Version 2.6 Features (Previous Release)
+
+### 1. Xahau Node State Validation ✓
+**What it did:** required `server_state: "full"`.
+
+> Superseded in v3.0, which also accepts `proposing` and `validating`.
 
 ### 2. API Version 1 Support ✓
-**New Check Added:**
-- Dedicated `server_info` call with `api_version: 1` parameter
-- Positioned as Method 2 (between websocat and standard API)
-- Uses auto-detected Xahau endpoint from config
+**Check Added:**
+- Dedicated `server_info` call with `api_version: 1`, positioned as
+  Method 2 (between websocat and the standard API).
 
 **Implementation:**
 ```bash
@@ -83,10 +131,10 @@ curl -X POST "$https_endpoint" \
 **Each port now displays:**
 - 80: HTTP (Let's Encrypt, redirects)
 - 443: HTTPS (SSL/TLS termination)
-- 22861-22870: User Ports (tenant WebSocket)
-- 26201-26210: Peer Ports (P2P communication)
-- 36525-36540: TCP Ports (tenant TCP)
-- 39064-39080: UDP Ports (tenant UDP)
+- 22861+ (1/instance): User Ports (tenant WebSocket)
+- 26201+ (1/instance): Peer Ports (P2P communication)
+- 36525+ (2/instance): TCP Ports (tenant TCP)
+- 39064+ (2/instance): UDP Ports (tenant UDP)
 
 ### 5. Xahau WSS Health Check ✓
 **Safe implementation:**
@@ -150,13 +198,18 @@ sudo ./evernode_health_check.sh --cron --skip-accounts
    - ✓ All existing checks still run
    - ✓ No breaking changes
 
-## 📊 Implementation Statistics
+## 📊 Implementation Statistics (v3.0)
 
-- **Lines of code added**: ~250
-- **New functions**: 3 (parse_arguments, get_port_purpose, analyze_port_usage, check_xahau_wss_connection)
-- **Modified functions**: 3 (main, check_evernode_accounts, generate_report)
-- **New flags**: 4 (--cron, --no-color, --skip-accounts, --verbose)
-- **Documentation files**: 3 (README.md updated, FEATURES.md created, SUMMARY.md created)
+- **Net change**: ~280 insertions / ~110 deletions in the script
+- **New functions**: `print_json_report`, `evaluate_server_state`
+- **Modified functions**: `main` (forwards `"$@"`), `parse_arguments`
+  (adds `--json`), `install_deps` (cron-safe, only-missing), `show_help`,
+  `check_xrpl_balance` (endpoint arg + EVR fix), `check_evernode_accounts`
+  (derives endpoint), `get_port_purpose` (range-based),
+  `calculate_required_ports` (off-by-one + UDP)
+- **New flags**: `--json` (in addition to the now-functional `--cron`,
+  `--no-color`, `--skip-accounts`, `--skip-logs`, `--verbose`)
+- **Documentation**: README.md, FEATURES.md, SUMMARY.md updated; LICENSE added
 
 ## 🔒 Safety Features
 
@@ -212,19 +265,21 @@ The script reads from these locations (in order):
 3. Decide whether to close unused ports or start required services
 4. Set up cron jobs for automated monitoring
 
-## 🎉 Key Improvements Over v2.0
+## 🎉 Key Improvements Across Versions
 
-| Feature | v2.0 | v2.5 |
-|---------|------|------|
-| Interactive prompts | ✓ | ✓ |
-| Auto-detection | Partial | Complete |
-| Cron mode | ✗ | ✓ |
-| Port usage analysis | ✗ | ✓ |
-| Port documentation | ✗ | ✓ |
-| Security warnings | Basic | Enhanced |
-| Xahau WSS check | ✗ | ✓ |
-| Command-line flags | ✗ | ✓ |
-| Log-friendly output | ✗ | ✓ |
+| Feature | v2.0 | v2.5/2.6 | v3.0 |
+|---------|------|----------|------|
+| Interactive prompts | ✓ | ✓ | ✓ |
+| Auto-detection | Partial | Complete | Complete |
+| Cron mode | ✗ | ✓ (but flags ignored) | ✓ (flags fixed) |
+| CLI flags actually apply | ✗ | ✗ | ✓ |
+| Port usage analysis | ✗ | ✓ | ✓ |
+| Correct port maths (UDP, >10 instances) | ✗ | ✗ | ✓ |
+| Xahau WSS check | ✗ | ✓ (full only) | ✓ (full/proposing/validating) |
+| Balance via node's own endpoint | ✗ | ✗ | ✓ |
+| EVR trustline read | broken | broken | ✓ |
+| JSON output for monitoring | ✗ | ✗ | ✓ |
+| LICENSE file | ✗ | ✗ | ✓ (MIT) |
 
 ## 🔧 Next Steps for User
 

@@ -1,28 +1,139 @@
 # Evernode Node Doctor - New Features Quick Reference
 
-## 🚀 Version 2.6 Features
+## 🚀 Version 3.0 Features
 
-### 1. Strict Xahau Node State Validation
+### 1. Command-Line Flags Now Apply (critical fix)
 
-**Purpose**: Ensure Xahau node is in "full" state before accepting tenant instances.
+**Purpose**: Make every documented flag actually take effect.
 
 **What Changed:**
-- Previously accepted: `full`, `validating`, or `proposing`
-- Now requires: **`full` ONLY**
+- Previous versions invoked `main` without forwarding `"$@"`, so
+  `--cron`, `--no-color`, `--skip-accounts`, `--skip-logs`, and `--help`
+  were silently ignored on a normal run. The flags now work.
 
 **Why This Matters:**
-- Ensures node is fully synchronized with the Xahau blockchain
-- Prevents issues with tenant instances on partially synced nodes
-- Provides clearer error messages when node is not ready
+- Documented cron jobs were running in interactive mode, not cron mode.
+- `--help` now prints usage and exits instead of running a full check.
+
+---
+
+### 2. JSON Output (`--json`) for Monitoring
+
+**Purpose**: Emit a machine-readable summary for monitoring pipelines.
+
+**Usage:**
+```bash
+sudo ./evernode_health_check.sh --json
+```
+
+**What It Does:**
+- Implies `--cron` and `--no-color` (no prompts, no ANSI codes).
+- Prints a single JSON object: overall status, counts, and the success /
+  warning / error message lists. Content is escaped via `jq`.
+
+**Example Output:**
+```json
+{
+  "status": "warning",
+  "timestamp": "2026-06-16T10:23:20Z",
+  "host": "evernode-host",
+  "counts": { "success": 41, "warning": 2, "error": 0 },
+  "successes": ["Docker service is running", "..."],
+  "warnings": ["Disk space below recommended (40GB available...)", "..."],
+  "errors": []
+}
+```
+
+**Exit Codes (JSON and normal runs):**
+- `0`: all checks clean
+- `1`: one or more errors
+- `2`: passing, but with warnings
+
+---
+
+### 3. Balance Checks Use Your Node's Endpoint
+
+**Purpose**: Query balances through your own Xahau node, accurately.
+
+**What Changed:**
+- The JSON-RPC endpoint is derived from your configured `rippledServer`
+  in `/etc/sashimono/mb-xrpl/mb-xrpl.cfg`, falling back to the public
+  Xahau RPC only if your node is unreachable.
+- Fixed a dead variable that shadowed the real EVR trustline read, so the
+  EVR balance is now reported correctly (from the canonical Evernode
+  issuer `rEvernodee8dJLaFsujS6q1EiXvZYmHXr8`).
+- Added `actNotFound` handling, signed-balance normalisation, and a basic
+  address-format check.
+
+**Note on thresholds:** the 50 XAH / 50 EVR figures are recommended
+operator **buffers**, not the protocol reserve minimum. The protocol
+minimum is the Xahau base reserve plus per-owned-object increments.
+
+---
+
+### 4. Correct Xahau Sync States
+
+**Purpose**: Don't false-alarm on a healthy validator.
+
+**What Changed:**
+- Accepts `full`, `proposing`, or `validating` as healthy synced states
+  (a validator legitimately reports proposing/validating). This reverts
+  the over-strict v2.6 "full only" behaviour.
+- Only `syncing`, `connected`, and `tracking` raise an error.
+
+**Example Output:**
+```
+Server State: proposing
+✓ Xahau node is synced and healthy (server_state: proposing)
+
+# Not yet ready:
+Server State: syncing
+✗ ERROR: Xahau node not fully synced (server_state: syncing).
+  Must reach full/proposing/validating before accepting tenants
+```
+
+---
+
+### 5. Correct Port Maths
+
+**Purpose**: Compute and label the right ports for any instance count.
+
+**What Changed:**
+- Fixed an off-by-one in the per-instance port calculation.
+- Included the UDP port range, which was previously dropped from the
+  required-ports set.
+- `get_port_purpose` is now range-based, so hosts with more than ~10
+  instances no longer report "Unknown port".
+
+---
+
+### 6. Cron-Safe Dependencies and Hardening
+
+**Purpose**: Behave well when run unattended.
+
+**What Changed:**
+- Installs only the tools that are actually missing, and in
+  `--cron`/`--json` mode never runs `apt-get` (no apt-lock contention
+  with `unattended-upgrades`); it warns and continues with degraded
+  checks instead.
+- Added `set -uo pipefail` for safer failure behaviour.
+- Added an MIT `LICENSE` file.
+
+---
+
+## 🚀 Version 2.6 Features
+
+### 1. Xahau Node State Validation
+
+**Purpose**: Confirm the Xahau node is synced before accepting tenants.
+
+> Note: v2.6 made this "full only". v3.0 corrected it to also accept
+> `proposing` and `validating` (see the v3.0 section above).
 
 **Example Output:**
 ```
 Server State: full
-✓ Xahau node is fully synced (server_state: full)
-
-# If not "full":
-Server State: syncing
-✗ ERROR: Xahau node state: syncing (MUST be 'full' to work properly)
+✓ Xahau node is synced and healthy (server_state: full)
 ```
 
 ---
@@ -152,10 +263,10 @@ sudo ufw delete allow 443
 **Port Categories:**
 - **80**: HTTP (Let's Encrypt validation, HTTP-to-HTTPS redirect)
 - **443**: HTTPS (SSL/TLS termination via reverse proxy)
-- **22861-22870**: Evernode User Ports (WebSocket connections from tenants)
-- **26201-26210**: Evernode Peer Ports (Sashimono P2P)
-- **36525-36540**: Evernode TCP Ports (Tenant TCP communication)
-- **39064-39080**: Evernode UDP Ports (Tenant UDP communication)
+- **22861+**: Evernode User Ports, 1 per instance (WebSocket connections from tenants)
+- **26201+**: Evernode Peer Ports, 1 per instance (Sashimono P2P)
+- **36525+**: Evernode TCP Ports, 2 per instance (Tenant TCP communication)
+- **39064+**: Evernode UDP Ports, 2 per instance (Tenant UDP communication)
 
 **Common Questions:**
 - **Q: Why is port 80/443 open but not in use?**
@@ -219,7 +330,9 @@ sudo chmod +x /usr/local/bin/websocat
 | `--cron` | `--silent` | Non-interactive mode (no prompts) |
 | `--no-color` | - | Disable color output for logs |
 | `--skip-accounts` | - | Skip XRPL account balance checks |
+| `--skip-logs` | - | Skip Evernode log analysis (saves ~1-2 minutes) |
 | `--verbose` | - | Show detailed debugging info |
+| `--json` | - | Machine-readable JSON summary (implies `--cron` + `--no-color`) |
 | `--help` | `-h` | Show help message |
 
 ### Common Combinations:
@@ -246,17 +359,17 @@ sudo ./evernode_health_check.sh --skip-accounts
 
 **1. Daily Full Health Check (2 AM):**
 ```bash
-0 2 * * * /root/evernode-node-doctor/evernode_health_check.sh --cron --no-color >> /var/log/evernode-daily.log 2>&1
+0 2 * * * /opt/evernode-node-doctor/evernode_health_check.sh --cron --no-color >> /var/log/evernode-daily.log 2>&1
 ```
 
 **2. Hourly Quick Check (skip accounts):**
 ```bash
-0 * * * * /root/evernode-node-doctor/evernode_health_check.sh --cron --skip-accounts --no-color >> /var/log/evernode-hourly.log 2>&1
+0 * * * * /opt/evernode-node-doctor/evernode_health_check.sh --cron --skip-accounts --no-color >> /var/log/evernode-hourly.log 2>&1
 ```
 
 **3. Weekly Full Audit (Sundays at 3 AM):**
 ```bash
-0 3 * * 0 /root/evernode-node-doctor/evernode_health_check.sh --cron --no-color > /var/log/evernode-weekly-$(date +\%Y\%m\%d).log 2>&1
+0 3 * * 0 /opt/evernode-node-doctor/evernode_health_check.sh --cron --no-color > /var/log/evernode-weekly-$(date +\%Y\%m\%d).log 2>&1
 ```
 
 ### Log Rotation:
