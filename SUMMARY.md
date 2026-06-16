@@ -1,4 +1,23 @@
-# Implementation Summary - Evernode Node Doctor v3.0
+# Implementation Summary - Evernode Node Doctor v3.1
+
+## ✅ Version 3.1 Updates - End-to-end / diagnostics
+
+New, kept honest for an on-host tool (complementary to the external
+onledger.net host-test):
+- Virtualisation detection (`systemd-detect-virt`).
+- Reputation contract opt-in as an explicit PASS/FAIL line.
+- Instance-slot zombie detection (read-only): `sa.sqlite` vs `docker ps`.
+- `--report <path>`: shareable diagnostic file.
+- `--external` (opt-in) + `--reflector <url>`: honest external
+  port-reachability via a public reflector (off by default).
+- Optional Node helper `gp-probe.js` for protocol-level checks
+  (user-port TLS handshake; real GP/HotPocket handshake when the
+  Evernode client lib is present). Skips cleanly with install
+  instructions if Node is absent; `--no-gp-probe` disables it.
+- Deliberately NOT done: on-demand instance spin-up (zombie-slot risk),
+  bash fake of the peer-visa/GP protocol. Those defer to onledger.net.
+
+New file: `gp-probe.js` (Node helper, read-only, never fakes a pass).
 
 ## ✅ Version 3.0 Updates - Successfully Implemented
 

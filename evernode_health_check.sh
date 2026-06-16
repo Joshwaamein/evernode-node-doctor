@@ -35,6 +35,13 @@ RECOMMENDED_EVR=50
 # when the node's own configured rippledServer cannot be reached.
 PUBLIC_XAHAU_RPC="https://xahau.network"
 
+# End-to-end / external check configuration.
+EXTERNAL_CHECK=0
+EXTERNAL_REFLECTOR="https://ports.yougetsignal.com/check-port.php"
+ONLEDGER_URL="https://api.onledger.net/host-test"
+REPORT_PATH=""
+GP_PROBE=1   # protocol-level checks via the Node helper (1=on, 0=off)
+
 # Global error flag and tracking arrays
 HAS_ERRORS=0
 declare -a SUCCESS_MESSAGES=()
@@ -69,6 +76,22 @@ parse_arguments() {
                 JSON_MODE=1
                 NO_COLOR=1
                 CRON_MODE=1
+                shift
+                ;;
+            --external)
+                EXTERNAL_CHECK=1
+                shift
+                ;;
+            --reflector)
+                EXTERNAL_REFLECTOR="$2"
+                shift 2
+                ;;
+            --report)
+                REPORT_PATH="$2"
+                shift 2
+                ;;
+            --no-gp-probe)
+                GP_PROBE=0
                 shift
                 ;;
             --help|-h)
@@ -108,7 +131,19 @@ Options:
   --verbose           Show detailed debugging information
   --json              Output a machine-readable JSON summary (implies
                       --cron and --no-color). For monitoring pipelines.
+  --external          Opt in to external port-reachability checks via a
+                      public reflector (shares your public IP:port with it).
+  --reflector <url>   Override the external reflector endpoint.
+  --report <path>     Write a shareable diagnostic report to <path>.
+  --no-gp-probe       Skip the protocol-level Node checks (user-port TLS,
+                      GP/HotPocket handshake).
   --help, -h          Show this help message
+
+End-to-end / external testing:
+  For an authoritative external + cluster test (domain-ownership proof,
+  peer-visa handshake) run from outside your host, see the community
+  service at https://api.onledger.net/host-test. This local tool and that
+  service are complementary.
 
 Examples:
   # Interactive mode (default)
@@ -1346,6 +1381,274 @@ generate_report() {
     check_ssl_certificate "$domain"
 }
 
+# Function to detect virtualisation type (matches the external tool's
+# "virtualisation details"). Read-only.
+check_virtualisation() {
+    print_color "$YELLOW" "\n=== Virtualisation Detection ==="
+    if check_command "systemd-detect-virt"; then
+        local virt
+        # systemd-detect-virt exits non-zero when virt is "none"; capture
+        # stdout regardless and default to "none" only on empty output.
+        virt=$(systemd-detect-virt 2>/dev/null)
+        [ -z "$virt" ] && virt="none"
+        if [ "$virt" = "none" ]; then
+            echo "Virtualisation: none (bare metal)"
+            log_success "Running on bare metal"
+        else
+            echo "Virtualisation: $virt"
+            log_success "Virtualisation detected: $virt"
+        fi
+    else
+        # Fallback: cpuinfo hypervisor flag.
+        if grep -q '^flags.*hypervisor' /proc/cpuinfo 2>/dev/null; then
+            log_info "Running under a hypervisor (type unknown; systemd-detect-virt absent)"
+        else
+            log_info "Virtualisation type could not be determined (systemd-detect-virt absent)"
+        fi
+    fi
+}
+
+# Function to surface reputation contract opt-in as its own PASS/FAIL
+# line rather than leaving it buried in raw 'evernode status' output.
+check_reputation_optin() {
+    print_color "$YELLOW" "\n=== Reputation Contract Opt-In ==="
+    if ! check_command "evernode"; then
+        log_warning "Evernode CLI not available; cannot read reputation opt-in"
+        return 1
+    fi
+    local status_out
+    status_out=$(evernode status 2>/dev/null)
+    if [ -z "$status_out" ]; then
+        log_warning "Unable to read 'evernode status' for reputation opt-in"
+        return 1
+    fi
+    # The CLI prints a line indicating reputation participation. Match
+    # common phrasings without assuming a single exact string.
+    if echo "$status_out" | grep -qiE 'reputation.*(opt|enabled|active|participat)'; then
+        local rep_line
+        rep_line=$(echo "$status_out" | grep -iE 'reputation' | head -2)
+        echo "$rep_line"
+        log_success "Reputation contract opt-in appears active"
+    else
+        log_warning "Reputation opt-in not detected in 'evernode status'. If you expect to earn reputation rewards, opt in with the Evernode CLI"
+    fi
+}
+
+# Function to detect a zombie reputation/instance slot: a row in
+# sa.sqlite marked 'running' with no backing Docker container. This is
+# the root cause of sustained reputation collapse (see the architecture
+# notes on the per-moment contract slot). READ ONLY: never deletes rows.
+check_instance_slots() {
+    print_color "$YELLOW" "\n=== Instance Slot Health (zombie detection) ==="
+    local db="/etc/sashimono/sa.sqlite"
+    if [ ! -f "$db" ]; then
+        log_info "Sashimono instance DB not found ($db); skipping slot check"
+        return 0
+    fi
+    if ! check_command "sqlite3"; then
+        log_warning "sqlite3 not installed; cannot inspect instance slots. Install with: apt-get install -y sqlite3"
+        return 1
+    fi
+    if ! check_command "docker"; then
+        log_warning "docker not available; cannot cross-check instance containers"
+        return 1
+    fi
+
+    # Names marked running in the DB.
+    local db_running
+    db_running=$(sqlite3 "$db" "SELECT name FROM instances WHERE status='running';" 2>/dev/null | sort -u)
+    # Names of actual running containers.
+    local docker_running
+    docker_running=$(docker ps --format '{{.Names}}' --no-trunc 2>/dev/null | sort -u)
+
+    if [ -z "$db_running" ]; then
+        log_success "No instances marked running in sa.sqlite (no zombie slots)"
+        return 0
+    fi
+
+    local zombies=0
+    local name
+    while IFS= read -r name; do
+        [ -z "$name" ] && continue
+        if ! echo "$docker_running" | grep -qxF "$name"; then
+            log_error "Zombie slot: '$name' is 'running' in sa.sqlite but has no Docker container. This consumes an instance slot and can collapse reputation"
+            zombies=$((zombies + 1))
+        fi
+    done <<< "$db_running"
+
+    if [ "$zombies" -eq 0 ]; then
+        log_success "All 'running' instance rows have a backing container (no zombies)"
+    else
+        echo "Fix: stop the agent, remove the stale row, rm the orphan home dir, restart the agent. Verify with 'evernode list'. Do not DELETE rows blindly while the agent is live."
+    fi
+}
+
+
+# Tier 2: honest external reachability. Asks a public TCP reachability
+# reflector whether a given port is open from the OUTSIDE. This is the
+# question that actually matters for Evernode and that a local nmap
+# cannot answer. Opt-in (--external) because it depends on a third-party
+# service and reveals the host's public IP:port to it.
+#
+# We do NOT relabel local nmap as "external". If the reflector is
+# unreachable, we report skip, not pass.
+check_external_reachability() {
+    local domain=$1
+    shift
+    local ports=("$@")
+
+    print_color "$YELLOW" "\n=== External Port Reachability (opt-in) ==="
+    if [ "$EXTERNAL_CHECK" -ne 1 ]; then
+        log_info "External reachability check skipped (enable with --external)"
+        return 0
+    fi
+    if [ ${#ports[@]} -eq 0 ]; then
+        log_warning "No ports to check externally"
+        return 0
+    fi
+    if [ -z "$domain" ]; then
+        log_warning "No domain/IP for external check"
+        return 0
+    fi
+
+    echo "Using external reflector: $EXTERNAL_REFLECTOR"
+    echo "Note: this shares your public IP and the tested ports with that service."
+    echo "For an authoritative external + cluster test, see: $ONLEDGER_URL"
+
+    local checked=0
+    local port
+    for port in "${ports[@]}"; do
+        case "$port" in
+            80|443) ;;
+            *) [ "$port" -ge "$EVR_USER_PORT_BASE" ] || continue ;;
+        esac
+        [ "$checked" -ge 8 ] && break
+        checked=$((checked + 1))
+
+        local resp
+        resp=$(curl -s --connect-timeout 8 --max-time 12 \
+            "${EXTERNAL_REFLECTOR}?host=${domain}&port=${port}" 2>/dev/null)
+        if [ -z "$resp" ]; then
+            log_warning "External reflector did not respond for port $port (skipped, not failed)"
+            continue
+        fi
+        if echo "$resp" | grep -qiE '"open"[[:space:]]*:[[:space:]]*true|reachable|open'; then
+            log_success "Port $port is reachable from the outside world"
+        else
+            log_error "Port $port is NOT reachable externally (firewall, router port-forward, or ISP). Fix port forwarding / firewall for $port"
+        fi
+    done
+
+    if [ "$checked" -eq 0 ]; then
+        log_info "No GP/standard ports were eligible for external probing"
+    fi
+}
+
+# Tier 3: run the optional Node helper for protocol-level checks. Fails
+# out cleanly with install instructions if Node is absent (never fakes).
+run_gp_probe() {
+    local mode=$1
+    local host=$2
+    local port=$3
+    local label=$4
+
+    local script_dir
+    script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+    local helper="$script_dir/gp-probe.js"
+
+    if ! check_command "node"; then
+        log_warning "$label skipped: Node.js is not installed."
+        echo "  The protocol-level checks (user-port TLS, GP/HotPocket handshake)"
+        echo "  need Node.js. Install it, then re-run:"
+        echo "    curl -fsSL https://deb.nodesource.com/setup_lts.x | sudo -E bash -"
+        echo "    sudo apt-get install -y nodejs"
+        echo "  Or use the external onledger.net host-test: $ONLEDGER_URL"
+        return 3
+    fi
+    if [ ! -f "$helper" ]; then
+        log_warning "$label skipped: helper not found at $helper"
+        return 3
+    fi
+
+    local result
+    result=$(node "$helper" "$mode" --host "$host" --port "$port" --timeout 10000 2>/dev/null)
+    local rc=$?
+    local status detail
+    status=$(echo "$result" | jq -r '.status // "fail"' 2>/dev/null)
+    detail=$(echo "$result" | jq -r '.detail // .reason // ""' 2>/dev/null)
+
+    case "$status" in
+        pass)  log_success "$label: $detail" ;;
+        skip)  log_info "$label skipped: $detail" ;;
+        *)     log_error "$label: ${detail:-probe failed}" ;;
+    esac
+    return $rc
+}
+
+
+# Tier 3 orchestrator: user-port TLS hairpin (via own public IP, the way
+# reputationd reaches its listener) and the real GP handshake when the
+# Evernode client lib is present.
+check_protocol_level() {
+    local public_ip=$1
+    print_color "$YELLOW" "\n=== Protocol-Level Checks (user port / GP handshake) ==="
+    if [ -z "$public_ip" ]; then
+        log_info "No public IP resolved; skipping protocol-level checks"
+        return 0
+    fi
+    local gp_port=$EVR_PEER_PORT_BASE
+    echo "Probing user/GP port ${gp_port} at public IP ${public_ip} (WAN hairpin path)"
+    run_gp_probe "userport" "$public_ip" "$gp_port" "User-port TLS reachability (hairpin)"
+    run_gp_probe "gp" "$public_ip" "$gp_port" "GP / HotPocket peer handshake"
+}
+
+# Write a shareable, self-contained diagnostic report (Tier 1). Mirrors
+# the external tool's "downloadable report you can share with support".
+write_report() {
+    local path=$1
+    [ -z "$path" ] && return 0
+    {
+        echo "Evernode Node Doctor diagnostic report"
+        echo "Generated: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        echo "Host: $(hostname 2>/dev/null || echo unknown)"
+        echo "Script version: v3.1"
+        echo ""
+        echo "=== System ==="
+        echo "Kernel: $(uname -sr 2>/dev/null)"
+        local virt_report
+        virt_report=$(systemd-detect-virt 2>/dev/null)
+        echo "Virtualisation: ${virt_report:-none}"
+        echo "CPU cores: $(nproc 2>/dev/null)"
+        echo "Uptime: $(uptime -p 2>/dev/null || uptime)"
+        echo ""
+        echo "=== Result counts ==="
+        echo "Successes: ${#SUCCESS_MESSAGES[@]}"
+        echo "Warnings:  ${#WARNING_MESSAGES[@]}"
+        echo "Errors:    ${#ERROR_MESSAGES[@]}"
+        echo ""
+        if [ ${#ERROR_MESSAGES[@]} -gt 0 ]; then
+            echo "=== ERRORS ==="
+            printf '  - %s\n' "${ERROR_MESSAGES[@]}"
+            echo ""
+        fi
+        if [ ${#WARNING_MESSAGES[@]} -gt 0 ]; then
+            echo "=== WARNINGS ==="
+            printf '  - %s\n' "${WARNING_MESSAGES[@]}"
+            echo ""
+        fi
+        echo "=== SUCCESSES ==="
+        printf '  - %s\n' "${SUCCESS_MESSAGES[@]}"
+    } > "$path" 2>/dev/null
+
+    if [ -f "$path" ]; then
+        log_success "Diagnostic report written: $path"
+        echo "Share this file with support, or see $ONLEDGER_URL for an external test."
+    else
+        log_warning "Could not write report to $path"
+    fi
+}
+
+
 # Main script execution
 main() {
     # Parse command-line arguments first
@@ -1378,7 +1681,7 @@ main() {
 "
     
     print_color "$BLUE" "======================================"
-    print_color "$BLUE" "       Health Check v3.0"
+    print_color "$BLUE" "       Health Check v3.1"
     if [ $CRON_MODE -eq 1 ]; then
         print_color "$YELLOW" "          [CRON MODE]"
     fi
@@ -1589,7 +1892,29 @@ main() {
     
     # Check Evernode account balances (CRITICAL)
     check_evernode_accounts
-    
+
+    # === End-to-end / diagnostic additions (v3.1) ===
+    # Virtualisation details.
+    check_virtualisation
+
+    # Reputation contract opt-in (explicit PASS/FAIL).
+    check_reputation_optin
+
+    # Instance slot / zombie detection (read-only).
+    check_instance_slots
+
+    # External port reachability (opt-in via --external).
+    check_external_reachability "$domain_name" "${required_ports[@]:-}"
+
+    # Protocol-level checks via the optional Node helper (user-port TLS,
+    # GP/HotPocket handshake), unless disabled with --no-gp-probe.
+    if [ "$GP_PROBE" -eq 1 ]; then
+        check_protocol_level "${resolved_ip:-$gateway_ip}"
+    else
+        print_color "$YELLOW" "\n=== Protocol-Level Checks ==="
+        log_info "Protocol-level checks skipped (--no-gp-probe)"
+    fi
+
     # Check fail2ban
     print_color "$YELLOW" "\n=== Fail2ban Status ==="
     if systemctl is-active --quiet fail2ban 2>/dev/null; then
@@ -1601,6 +1926,10 @@ main() {
     
     # Check Evernode logs (intensive operation, runs last)
     check_evernode_logs
+
+    # Write a shareable diagnostic report if requested (captures all
+    # results gathered above). Done before any exit path.
+    write_report "$REPORT_PATH"
 
     # JSON mode: emit the machine-readable report and exit with the
     # appropriate code, skipping the human-readable summary entirely.

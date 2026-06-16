@@ -1,5 +1,30 @@
 # Evernode Node Doctor - New Features Quick Reference
 
+## 🚀 Version 3.1 Features (end-to-end / diagnostics)
+
+Complementary to the external community tester at
+https://api.onledger.net/host-test (which probes from outside and proves
+domain ownership). This local tool adds, on-host:
+
+- **Virtualisation detection** (`systemd-detect-virt`).
+- **Reputation contract opt-in** as an explicit PASS/FAIL line.
+- **Instance-slot zombie detection** (read-only): `sa.sqlite` "running"
+  rows vs live Docker containers. A zombie slot is the classic cause of
+  sustained reputation collapse.
+- **`--report <path>`**: shareable, self-contained diagnostic file.
+- **`--external`** (opt-in) + **`--reflector <url>`**: honest external
+  port-reachability via a public reflector. Off by default (shares your
+  public IP:port). Local nmap is never relabelled as external.
+- **Optional Node helper `gp-probe.js`**: real TLS handshake on the
+  user/GP port (the WAN-hairpin path reputationd uses) and the real
+  GP/HotPocket peer handshake when the Evernode client lib is present.
+  If Node.js is absent, these are skipped with install instructions,
+  never faked. Disable with **`--no-gp-probe`**.
+
+Deliberately not done: on-demand HotPocket instance spin-up (zombie-slot
+risk) and a bash fake of the peer-visa/GP protocol. For an authoritative
+external + cluster handshake, use the onledger.net service.
+
 ## 🚀 Version 3.0 Features
 
 ### 1. Command-Line Flags Now Apply (critical fix)

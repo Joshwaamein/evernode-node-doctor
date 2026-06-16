@@ -3,6 +3,40 @@
 ## Overview
 The **Evernode Node Doctor** is a comprehensive, one-stop validation tool that verifies all requirements for running an Evernode node are properly met. This bash script performs exhaustive checks across system resources, Docker infrastructure, network configuration, security settings, and XRPL account balances to ensure your Evernode host is production-ready.
 
+## ✨ New in v3.1
+
+End-to-end and diagnostic additions, complementary to the external
+community tester at https://api.onledger.net/host-test (which probes
+your host from the outside and cryptographically proves domain
+ownership). This local tool keeps the fast, private, on-host checks and
+now adds:
+
+- **Virtualisation detection** (`systemd-detect-virt`): bare metal vs
+  KVM/LXC/etc.
+- **Reputation contract opt-in** surfaced as an explicit PASS/FAIL line.
+- **Instance-slot zombie detection** (read-only): cross-checks
+  `sa.sqlite` "running" rows against live Docker containers. A zombie
+  slot is the classic cause of sustained reputation collapse.
+- **`--report <path>`**: writes a shareable, self-contained diagnostic
+  report (the on-host equivalent of the external tool's downloadable
+  report).
+- **`--external`** (opt-in): honest external port-reachability via a
+  public reflector. This is the question a local nmap cannot answer. It
+  is off by default because it shares your public IP:port with a third
+  party. We never relabel the local nmap as an external test.
+- **Protocol-level checks via an optional Node helper (`gp-probe.js`)**:
+  a real TLS handshake against your user/GP port over the WAN-hairpin
+  path (the path reputationd uses each moment), and the real
+  GP/HotPocket peer handshake when the Evernode client library is
+  present. If Node.js is not installed, these checks are **skipped
+  cleanly with install instructions**, never faked. Disable with
+  `--no-gp-probe`.
+
+> What we deliberately do NOT do: spin up a real HotPocket instance on
+> demand (that risks the zombie-slot failure mode), or fake the
+> peer-visa / GP protocol in bash. For an authoritative external +
+> cluster handshake test, use the onledger.net service above.
+
 ## ✨ New in v3.0
 
 ### 🐛 Critical fix: command-line flags now actually apply
@@ -256,6 +290,10 @@ sudo ./evernode_health_check.sh --cron --no-color --skip-accounts
 --skip-logs         Skip Evernode log analysis (saves ~1-2 minutes)
 --verbose           Show detailed debugging information
 --json              Output a machine-readable JSON summary (implies --cron and --no-color)
+--external          Opt in to external port-reachability checks via a public reflector
+--reflector <url>   Override the external reflector endpoint
+--report <path>     Write a shareable diagnostic report to <path>
+--no-gp-probe       Skip the protocol-level Node checks (user-port TLS, GP/HotPocket handshake)
 --help, -h          Show this help message
 ```
 
@@ -343,6 +381,10 @@ Schedule periodic health checks for automated monitoring:
 - `fail2ban` - Security monitoring
 - `netstat` or `ss` - Port listening analysis
 - `websocat` - WebSocket testing (for Xahau WSS health check)
+- `node` (Node.js) - Protocol-level checks (user-port TLS, GP/HotPocket
+  handshake) via `gp-probe.js`. If absent, those checks are skipped with
+  install instructions, not faked.
+- `sqlite3` - Instance-slot zombie detection against `sa.sqlite`
 
 **Note:** The script will attempt to install missing dependencies automatically.
 
@@ -814,7 +856,30 @@ If this project is useful to you, consider supporting it:
 
 ## Changelog
 
-### Version 3.0 (Current)
+### Version 3.1 (Current)
+- **End-to-end / diagnostic additions** inspired by the external
+  community tester (https://api.onledger.net/host-test), kept honest for
+  an on-host tool:
+  - Virtualisation detection (`systemd-detect-virt`).
+  - Reputation contract opt-in as an explicit PASS/FAIL line.
+  - Instance-slot zombie detection (read-only): `sa.sqlite` "running"
+    rows cross-checked against live Docker containers.
+  - `--report <path>`: shareable, self-contained diagnostic file.
+  - `--external` (opt-in) + `--reflector <url>`: honest external
+    port-reachability via a public reflector; off by default because it
+    shares your public IP:port. Local nmap is never relabelled as
+    external.
+  - Optional Node helper `gp-probe.js` for protocol-level checks: a real
+    TLS handshake on the user/GP port (the WAN-hairpin path reputationd
+    uses) and the real GP/HotPocket peer handshake when the Evernode
+    client lib is present. If Node.js is absent, these are skipped with
+    install instructions, never faked. Disable with `--no-gp-probe`.
+- **Deliberately not done:** on-demand HotPocket instance spin-up (zombie
+  -slot risk) and a bash fake of the peer-visa/GP protocol. For an
+  authoritative external + cluster test, the README points to the
+  onledger.net service. The two tools are complementary.
+
+### Version 3.0
 - **Fixed: CLI flags were silently ignored.** `main` was invoked without
   forwarding `"$@"`, so `--cron`, `--no-color`, `--skip-accounts`,
   `--skip-logs`, and `--help` had no effect when run normally. Now fixed.
