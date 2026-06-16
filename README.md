@@ -3,13 +3,53 @@
 ## Overview
 The **Evernode Node Doctor** is a comprehensive, one-stop validation tool that verifies all requirements for running an Evernode node are properly met. This bash script performs exhaustive checks across system resources, Docker infrastructure, network configuration, security settings, and XRPL account balances to ensure your Evernode host is production-ready.
 
-## ✨ New Features (v2.6)
+## ✨ New in v3.0
+
+### 🐛 Critical fix: command-line flags now actually apply
+Prior versions called `main` without forwarding `"$@"`, so every flag
+(`--cron`, `--no-color`, `--skip-accounts`, `--skip-logs`, `--help`) was
+silently ignored when the script was run normally. They now take effect.
+
+### 📊 JSON output (`--json`) for monitoring pipelines
+Emit a machine-readable summary (status, counts, and the success /
+warning / error lists) for ingestion by Zabbix, Prometheus textfile
+collectors, healthchecks.io, etc. Implies `--cron` and `--no-color`.
+Exit codes: `0` clean, `1` errors, `2` passing-with-warnings.
+
+### 🔌 Balance checks use your node's own endpoint
+Account balance lookups now derive the JSON-RPC endpoint from your
+configured `rippledServer` (from `mb-xrpl.cfg`) and fall back to the
+public Xahau RPC only if your node is unreachable. The EVR trustline
+read was also fixed (a dead variable previously shadowed the real read).
+
+### ✅ Wider, correct Xahau sync states
+A node reporting `full`, `proposing`, or `validating` is treated as
+healthy (a validator legitimately reports the latter two). Only
+`syncing` / `connected` / `tracking` raise an error.
+
+### 🧮 Correct port maths
+Fixed an off-by-one in the per-instance port calculation, included the
+UDP port range (previously dropped from the required set), and made the
+port-purpose lookup range-based so hosts with more than ~10 instances no
+longer report "Unknown port".
+
+### 🤝 Cron-safe dependency handling
+The script no longer runs `apt-get update`/`install` on every
+invocation. It installs only missing tools, and in `--cron`/`--json`
+mode it never touches the apt lock (it warns about missing tools and
+continues with degraded checks).
+
+## ✨ Features from v2.6
 
 ### 📋 Evernode Log Analysis
 Automatically analyzes Evernode logs for errors, failures, and critical issues. Generates comprehensive logs via `evernode log` command and searches for problems. Includes 5-second warning and `--skip-logs` option to skip this intensive check.
 
 ### 🔒 Strict Xahau Node State Validation
-The Xahau node health check now strictly requires `server_state: "full"` for proper operation. Previously accepted "validating" or "proposing", but now only "full" state is considered healthy. This ensures your node is fully synchronized before accepting tenant instances.
+The Xahau node health check accepts `full`, `proposing`, or `validating`
+as healthy synced states (v3.0 corrected the over-strict v2.6 behaviour
+that rejected proposing/validating; a validator legitimately reports
+those). Only `syncing`, `connected`, and `tracking` are flagged as not
+yet ready to accept tenant instances.
 
 ### 🔌 Enhanced API Version 1 Support
 Added dedicated `server_info` check with `api_version: 1` parameter for better compatibility and validation. This provides an additional verification layer for Xahau node connectivity.
@@ -130,9 +170,9 @@ Running an Evernode node requires meeting numerous technical requirements across
 ### 10. XRPL Account Balance Verification (CRITICAL)
 - **Auto-Detection**: Reads accounts from Evernode config.json
 - **Host Account Validation**:
-  - XAH balance check (minimum 50 XAH recommended)
+  - XAH balance check (50 XAH recommended buffer; not the protocol reserve minimum)
   - EVR trust line detection
-  - EVR balance check (minimum 50 EVR recommended)
+  - EVR balance check (50 EVR recommended buffer)
 - **Reputation Account Validation**:
   - Same checks as host account
 - **API Integration**: Uses public XRPL cluster API
@@ -215,8 +255,34 @@ sudo ./evernode_health_check.sh --cron --no-color --skip-accounts
 --skip-accounts     Skip XRPL account balance checks
 --skip-logs         Skip Evernode log analysis (saves ~1-2 minutes)
 --verbose           Show detailed debugging information
+--json              Output a machine-readable JSON summary (implies --cron and --no-color)
 --help, -h          Show this help message
 ```
+
+### 📊 JSON Mode (for monitoring)
+
+Emit a single JSON object describing the run, suitable for piping into a
+monitoring system:
+
+```bash
+sudo ./evernode_health_check.sh --json
+```
+
+Example output:
+```json
+{
+  "status": "warning",
+  "timestamp": "2026-06-16T10:23:20Z",
+  "host": "evernode-host",
+  "counts": { "success": 41, "warning": 2, "error": 0 },
+  "successes": ["Docker service is running", "..."],
+  "warnings": ["Disk space below recommended (40GB available...)", "..."],
+  "errors": []
+}
+```
+
+Exit codes in JSON mode: `0` (all clean), `1` (one or more errors), `2`
+(passing but with warnings). The non-JSON run uses the same codes.
 
 ### Examples
 
@@ -247,17 +313,17 @@ Schedule periodic health checks for automated monitoring:
 **Daily Health Check (2 AM):**
 ```bash
 # Add to crontab: sudo crontab -e
-0 2 * * * /root/evernode-node-doctor/evernode_health_check.sh --cron --no-color >> /var/log/evernode-health.log 2>&1
+0 2 * * * /opt/evernode-node-doctor/evernode_health_check.sh --cron --no-color >> /var/log/evernode-health.log 2>&1
 ```
 
 **Hourly Quick Check (skip accounts for speed):**
 ```bash
-0 * * * * /root/evernode-node-doctor/evernode_health_check.sh --cron --skip-accounts --no-color >> /var/log/evernode-hourly.log 2>&1
+0 * * * * /opt/evernode-node-doctor/evernode_health_check.sh --cron --skip-accounts --no-color >> /var/log/evernode-hourly.log 2>&1
 ```
 
 **Weekly Full Audit (with log rotation):**
 ```bash
-0 3 * * 0 /root/evernode-node-doctor/evernode_health_check.sh --cron --no-color > /var/log/evernode-weekly-$(date +\%Y\%m\%d).log 2>&1
+0 3 * * 0 /opt/evernode-node-doctor/evernode_health_check.sh --cron --no-color > /var/log/evernode-weekly-$(date +\%Y\%m\%d).log 2>&1
 ```
 
 ## Requirements
@@ -720,10 +786,10 @@ sudo systemctl enable certbot.timer
 sudo crontab -e
 
 # Add daily check (2 AM)
-0 2 * * * /root/evernode-node-doctor/evernode_health_check.sh --cron --no-color >> /var/log/evernode-health.log 2>&1
+0 2 * * * /opt/evernode-node-doctor/evernode_health_check.sh --cron --no-color >> /var/log/evernode-health.log 2>&1
 
 # Add monthly full audit
-0 3 1 * * /root/evernode-node-doctor/evernode_health_check.sh --cron > /var/log/evernode-audit-$(date +\%Y\%m).log 2>&1
+0 3 1 * * /opt/evernode-node-doctor/evernode_health_check.sh --cron > /var/log/evernode-audit-$(date +\%Y\%m).log 2>&1
 ```
 
 ## Contributing
@@ -732,7 +798,7 @@ Contributions are welcome! Please feel free to submit issues or pull requests.
 
 ## License
 
-This project is open source. Please check the repository for license details.
+Released under the MIT License. See the [LICENSE](LICENSE) file for details.
 
 ## Support
 
@@ -748,7 +814,35 @@ If this project is useful to you, consider supporting it:
 
 ## Changelog
 
-### Version 2.6 (Current)
+### Version 3.0 (Current)
+- **Fixed: CLI flags were silently ignored.** `main` was invoked without
+  forwarding `"$@"`, so `--cron`, `--no-color`, `--skip-accounts`,
+  `--skip-logs`, and `--help` had no effect when run normally. Now fixed.
+- **Added `--json`** machine-readable output mode for monitoring
+  pipelines (status, counts, and message lists). Implies `--cron` and
+  `--no-color`. Exit codes: 0 clean, 1 errors, 2 warnings-only.
+- **Fixed balance check endpoint.** Now derives the JSON-RPC endpoint
+  from the node's own configured `rippledServer`, falling back to the
+  public Xahau RPC only if unreachable. Also fixed a dead variable that
+  shadowed the real EVR trustline read, and added signed-balance and
+  `actNotFound` handling.
+- **Widened healthy Xahau states.** `full`, `proposing`, and
+  `validating` all pass (a validator legitimately reports the latter
+  two); only `syncing`/`connected`/`tracking` error. Reverts the
+  over-strict v2.6 behaviour.
+- **Fixed port maths.** Corrected an off-by-one in the per-instance port
+  calculation, included the UDP port range (previously dropped), and
+  made `get_port_purpose` range-based (no more "Unknown port" beyond ~10
+  instances).
+- **Cron-safe dependencies.** Installs only missing tools and never
+  touches the apt lock in `--cron`/`--json` mode.
+- **Hardened the script.** Added `set -uo pipefail`, address-format
+  validation, and clearer balance messaging (the 50 XAH/EVR thresholds
+  are explicitly framed as recommended buffers, not the protocol reserve
+  minimum).
+- **Added a LICENSE file** (MIT).
+
+### Version 2.6
 - **Added Evernode Log Analysis**: Analyzes `evernode log` output for errors and failures
 - **Added --skip-logs Flag**: Skip intensive log generation (saves 1-2 minutes)
 - **Added Strict Server State Validation**: Now requires `server_state: "full"` for proper operation (previously accepted "validating" or "proposing")

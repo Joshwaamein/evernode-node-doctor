@@ -1,4 +1,12 @@
 #!/bin/bash
+#
+# Evernode Node Doctor - health check for Evernode hosts on Xahau.
+# Safe to run interactively or from cron. See --help for options.
+
+# Fail on unset variables and on any command in a pipeline failing.
+# We deliberately do NOT use 'set -e': this script runs many checks
+# that are allowed to fail individually without aborting the whole run.
+set -uo pipefail
 
 # Color definitions
 RED='\033[0;31m'
@@ -13,6 +21,19 @@ NO_COLOR=0
 SKIP_ACCOUNTS=0
 SKIP_LOGS=0
 VERBOSE=0
+JSON_MODE=0
+
+# EVR token issuer on Xahau mainnet (protocol constant, public).
+EVR_ISSUER="rEvernodee8dJLaFsujS6q1EiXvZYmHXr8"
+
+# Recommended best-practice balances (operator buffer, NOT the protocol
+# minimum; the protocol minimum is the Xahau base+owner reserve).
+RECOMMENDED_XAH=50
+RECOMMENDED_EVR=50
+
+# Public Xahau JSON-RPC endpoint, used only as a last-resort fallback
+# when the node's own configured rippledServer cannot be reached.
+PUBLIC_XAHAU_RPC="https://xahau.network"
 
 # Global error flag and tracking arrays
 HAS_ERRORS=0
@@ -42,6 +63,12 @@ parse_arguments() {
                 ;;
             --verbose)
                 VERBOSE=1
+                shift
+                ;;
+            --json)
+                JSON_MODE=1
+                NO_COLOR=1
+                CRON_MODE=1
                 shift
                 ;;
             --help|-h)
@@ -79,6 +106,8 @@ Options:
   --skip-accounts     Skip XRPL account balance checks
   --skip-logs         Skip Evernode log analysis (saves ~1-2 minutes)
   --verbose           Show detailed debugging information
+  --json              Output a machine-readable JSON summary (implies
+                      --cron and --no-color). For monitoring pipelines.
   --help, -h          Show this help message
 
 Examples:
@@ -171,6 +200,45 @@ print_summary_report() {
     print_color "$BLUE" "\n=========================================="
 }
 
+# Emit a machine-readable JSON summary (for monitoring pipelines).
+# Uses jq to build valid JSON so message contents are safely escaped.
+print_json_report() {
+    local status="ok"
+    if [ "$HAS_ERRORS" -eq 1 ]; then
+        status="error"
+    elif [ ${#WARNING_MESSAGES[@]} -gt 0 ]; then
+        status="warning"
+    fi
+
+    # Build JSON arrays from the message arrays. printf '%s\0' is null
+    # safe; jq -Rs splits on newlines. Empty arrays handled gracefully.
+    local successes warnings errors
+    successes=$(printf '%s\n' "${SUCCESS_MESSAGES[@]:-}" | jq -Rs 'split("\n") | map(select(length > 0))')
+    warnings=$(printf '%s\n' "${WARNING_MESSAGES[@]:-}" | jq -Rs 'split("\n") | map(select(length > 0))')
+    errors=$(printf '%s\n' "${ERROR_MESSAGES[@]:-}" | jq -Rs 'split("\n") | map(select(length > 0))')
+
+    jq -n \
+        --arg status "$status" \
+        --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        --arg host "$(hostname 2>/dev/null || echo unknown)" \
+        --argjson successes "$successes" \
+        --argjson warnings "$warnings" \
+        --argjson errors "$errors" \
+        '{
+            status: $status,
+            timestamp: $ts,
+            host: $host,
+            counts: {
+                success: ($successes | length),
+                warning: ($warnings | length),
+                error: ($errors | length)
+            },
+            successes: $successes,
+            warnings: $warnings,
+            errors: $errors
+        }'
+}
+
 # Function to check if command exists
 check_command() {
     if ! command -v "$1" &> /dev/null; then
@@ -180,19 +248,49 @@ check_command() {
     return 0
 }
 
-# Function to install dependencies
+# Function to install dependencies (only the missing ones; never in cron/json mode)
 install_deps() {
-    print_color "$YELLOW" "Installing dependencies..."
-    
+    # Map: command -> apt package providing it.
+    local -A pkg_for=(
+        [nmap]=nmap [dig]=dnsutils [curl]=curl [ufw]=ufw
+        [openssl]=openssl [jq]=jq [docker]=docker.io [bc]=bc
+        [netstat]=net-tools
+    )
+
+    local missing=()
+    local cmd
+    for cmd in "${!pkg_for[@]}"; do
+        if ! command -v "$cmd" &>/dev/null; then
+            missing+=("${pkg_for[$cmd]}")
+        fi
+    done
+
+    if [ ${#missing[@]} -eq 0 ]; then
+        log_info "All required tools already present; skipping dependency install"
+        return 0
+    fi
+
+    # In cron/json mode, never mutate the system or grab the apt lock.
+    # Just report what is missing and continue with degraded checks.
+    if [ $CRON_MODE -eq 1 ]; then
+        log_warning "Missing tools in non-interactive mode (not installing): ${missing[*]}"
+        return 0
+    fi
+
+    print_color "$YELLOW" "Installing missing dependencies: ${missing[*]}"
+
     if ! apt-get update; then
         log_error "Failed to update package lists"
         return 1
     fi
-    
-    if ! apt-get install -y nmap dnsutils curl ufw openssl jq docker.io bc net-tools 2>/dev/null; then
+
+    # De-duplicate the package list before installing.
+    local uniq_pkgs
+    mapfile -t uniq_pkgs < <(printf '%s\n' "${missing[@]}" | sort -u)
+    if ! apt-get install -y "${uniq_pkgs[@]}" 2>/dev/null; then
         log_warning "Some dependencies failed to install. Continuing anyway..."
     fi
-    
+
     log_success "Dependencies installation completed"
 }
 
@@ -425,23 +523,33 @@ check_open_ports_security() {
     fi
 }
 
-# Function to check XRPL account balances
+# Function to check XRPL/Xahau account balances.
+#   $1 = account address
+#   $2 = human-readable account name
+#   $3 = JSON-RPC endpoint to query (https://...). Optional; falls back
+#        to the public Xahau RPC if empty.
 check_xrpl_balance() {
     local account=$1
     local account_name=$2
-    
+    local api_url=${3:-$PUBLIC_XAHAU_RPC}
+
     if [ -z "$account" ]; then
         log_error "No account address provided for $account_name"
         return 1
     fi
-    
+
+    # Basic sanity check: Xahau/XRPL classic addresses start with 'r'.
+    if [[ ! "$account" =~ ^r[1-9A-HJ-NP-Za-km-z]{24,34}$ ]]; then
+        log_warning "$account_name address looks malformed: $account"
+    fi
+
     print_color "$YELLOW" "\nChecking balance for $account_name: $account"
-    
-    # Query Xahau using public API (Evernode runs on Xahau, not XRPL)
-    local api_url="https://xahau.network"
-    
-    local response=$(curl -s -X POST "$api_url" \
+    [ $VERBOSE -eq 1 ] && echo "  Using endpoint: $api_url"
+
+    local response
+    response=$(curl -s -X POST "$api_url" \
         -H "Content-Type: application/json" \
+        --connect-timeout 10 --max-time 15 \
         -d "{
             \"method\": \"account_info\",
             \"params\": [{
@@ -449,36 +557,66 @@ check_xrpl_balance() {
                 \"ledger_index\": \"validated\"
             }]
         }" 2>/dev/null)
-    
+
+    # Fall back to the public Xahau RPC if the configured endpoint failed
+    # and we were not already using it.
+    if [ -z "$response" ] && [ "$api_url" != "$PUBLIC_XAHAU_RPC" ]; then
+        log_warning "Configured endpoint did not respond, retrying via public Xahau RPC"
+        api_url=$PUBLIC_XAHAU_RPC
+        response=$(curl -s -X POST "$api_url" \
+            -H "Content-Type: application/json" \
+            --connect-timeout 10 --max-time 15 \
+            -d "{
+                \"method\": \"account_info\",
+                \"params\": [{
+                    \"account\": \"$account\",
+                    \"ledger_index\": \"validated\"
+                }]
+            }" 2>/dev/null)
+    fi
+
     if [ -z "$response" ]; then
-        log_error "Failed to retrieve balance for $account_name"
+        log_error "Failed to retrieve balance for $account_name (no response)"
         return 1
     fi
-    
-    # Parse XAH balance (XRP in drops, divide by 1000000)
-    local xah_drops=$(echo "$response" | jq -r '.result.account_data.Balance // "error"' 2>/dev/null)
-    
-    if [ "$xah_drops" == "error" ] || [ "$xah_drops" == "null" ] || [ -z "$xah_drops" ]; then
-        log_error "Unable to parse balance for $account_name. Account may not exist or API error occurred"
+
+    # Surface an explicit ledger error (e.g. actNotFound) rather than a
+    # vague parse failure.
+    local rpc_error
+    rpc_error=$(echo "$response" | jq -r '.result.error // empty' 2>/dev/null)
+    if [ -n "$rpc_error" ]; then
+        log_error "$account_name lookup returned '$rpc_error' (account may be unfunded or not yet activated)"
         return 1
     fi
-    
-    local xah_balance=$(echo "scale=2; $xah_drops / 1000000" | bc 2>/dev/null)
-    echo "  XAH Balance: $xah_balance XAH"
-    
-    # Check if balance is above 50 XAH
-    if (( $(echo "$xah_balance >= 50" | bc -l 2>/dev/null) )); then
-        log_success "$account_name has sufficient XAH balance (${xah_balance} XAH)"
+
+    # XAH balance is in drops (1 XAH = 1,000,000 drops).
+    local xah_drops
+    xah_drops=$(echo "$response" | jq -r '.result.account_data.Balance // empty' 2>/dev/null)
+
+    if [ -z "$xah_drops" ]; then
+        log_error "Unable to parse XAH balance for $account_name"
+        return 1
+    fi
+
+    local xah_balance owner_count
+    xah_balance=$(echo "scale=6; $xah_drops / 1000000" | bc 2>/dev/null)
+    owner_count=$(echo "$response" | jq -r '.result.account_data.OwnerCount // 0' 2>/dev/null)
+    echo "  XAH Balance: $xah_balance XAH (OwnerCount: $owner_count)"
+
+    # NOTE: the protocol minimum is the Xahau base reserve plus
+    # per-owned-object increments, not a flat number. The threshold
+    # below is a recommended operator buffer on top of that reserve.
+    if (( $(echo "$xah_balance >= $RECOMMENDED_XAH" | bc -l 2>/dev/null || echo 0) )); then
+        log_success "$account_name has a healthy XAH buffer (${xah_balance} XAH, >= ${RECOMMENDED_XAH} recommended)"
     else
-        log_warning "$account_name has insufficient XAH balance (${xah_balance} XAH, needs >= 50 XAH)"
+        log_warning "$account_name XAH below the recommended buffer (${xah_balance} XAH, ${RECOMMENDED_XAH} recommended). This is guidance, not the protocol reserve minimum"
     fi
-    
-    # Check EVR balance (if applicable - EVR is a trust line)
-    local evr_balance=$(echo "$response" | jq -r '.result.account_data.Balance // "0"' 2>/dev/null)
-    
-    # Query for trust lines to get EVR balance
-    local trustlines_response=$(curl -s -X POST "$api_url" \
+
+    # EVR is an issued trustline asset on Xahau. Read it from account_lines.
+    local trustlines_response
+    trustlines_response=$(curl -s -X POST "$api_url" \
         -H "Content-Type: application/json" \
+        --connect-timeout 10 --max-time 15 \
         -d "{
             \"method\": \"account_lines\",
             \"params\": [{
@@ -486,20 +624,28 @@ check_xrpl_balance() {
                 \"ledger_index\": \"validated\"
             }]
         }" 2>/dev/null)
-    
-    # Look for EVR trustline (currency code: EVR, issuer: rEvernodee8dJLaFsujS6q1EiXvZYmHXr8)
-    local evr_line=$(echo "$trustlines_response" | jq -r '.result.lines[] | select(.currency == "EVR" and .account == "rEvernodee8dJLaFsujS6q1EiXvZYmHXr8") | .balance' 2>/dev/null | head -1)
-    
+
+    # Match the EVR currency from the canonical Evernode issuer. The
+    # balance can be reported as a negative string depending on which
+    # side of the trustline issued it; normalise to an absolute value.
+    local evr_line
+    evr_line=$(echo "$trustlines_response" | \
+        jq -r --arg iss "$EVR_ISSUER" \
+        '.result.lines[]? | select(.currency == "EVR" and .account == $iss) | .balance' \
+        2>/dev/null | head -1)
+
     if [ -n "$evr_line" ] && [ "$evr_line" != "null" ]; then
+        # Strip a leading minus for the threshold comparison only.
+        local evr_abs=${evr_line#-}
         echo "  EVR Balance: $evr_line EVR"
-        
-        if (( $(echo "$evr_line >= 50" | bc -l 2>/dev/null) )); then
-            log_success "$account_name has sufficient EVR balance (${evr_line} EVR)"
+
+        if (( $(echo "$evr_abs >= $RECOMMENDED_EVR" | bc -l 2>/dev/null || echo 0) )); then
+            log_success "$account_name has a healthy EVR buffer (${evr_line} EVR, >= ${RECOMMENDED_EVR} recommended)"
         else
-            log_warning "$account_name has insufficient EVR balance (${evr_line} EVR, needs >= 50 EVR)"
+            log_warning "$account_name EVR below the recommended buffer (${evr_line} EVR, ${RECOMMENDED_EVR} recommended)"
         fi
     else
-        log_warning "No EVR trust line found for $account_name or EVR balance is 0"
+        log_warning "No EVR trust line found for $account_name (issuer ${EVR_ISSUER}), or EVR balance is 0"
     fi
 }
 
@@ -586,6 +732,25 @@ check_evernode_host_status() {
     fi
 }
 
+# Evaluate a Xahau server_state and log the appropriate result.
+# A node that is "full", "proposing", or "validating" is synced and
+# healthy (a validator legitimately reports proposing/validating). Only
+# the pre-sync states warrant an error.
+evaluate_server_state() {
+    local state=$1
+    case "$state" in
+        full|proposing|validating)
+            log_success "Xahau node is synced and healthy (server_state: $state)"
+            ;;
+        connected|syncing|tracking)
+            log_error "Xahau node not fully synced (server_state: $state). Must reach full/proposing/validating before accepting tenants"
+            ;;
+        *)
+            log_warning "Xahau node reported an unexpected server_state: $state"
+            ;;
+    esac
+}
+
 # Function to check Xahau WSS connection
 check_xahau_wss_connection() {
     print_color "$YELLOW" "\n=== Xahau WSS Connection Health Check ==="
@@ -620,11 +785,7 @@ check_xahau_wss_connection() {
             echo "  Ledger Range: $complete_ledgers"
             echo "  Server State: $server_state"
             
-            if [ "$server_state" == "full" ]; then
-                log_success "Xahau node is fully synced (server_state: full)"
-            else
-                log_error "Xahau node state: $server_state (MUST be 'full' to work properly)"
-            fi
+            evaluate_server_state "$server_state"
             return 0
         else
             log_warning "WebSocket test failed, trying HTTPS API fallback..."
@@ -652,11 +813,7 @@ check_xahau_wss_connection() {
         server_state_v1=$(echo "$api_v1_response" | jq -r '.result.info.server_state // "unknown"' 2>/dev/null)
         echo "  Server State (API v1): $server_state_v1"
         
-        if [ "$server_state_v1" == "full" ]; then
-            log_success "Xahau node is fully synced (server_state: full)"
-        else
-            log_error "Xahau node state: $server_state_v1 (MUST be 'full' to work properly)"
-        fi
+        evaluate_server_state "$server_state_v1"
         
         build_version_v1=$(echo "$api_v1_response" | jq -r '.result.info.build_version // "unknown"' 2>/dev/null)
         complete_ledgers_v1=$(echo "$api_v1_response" | jq -r '.result.info.complete_ledgers // "unknown"' 2>/dev/null)
@@ -687,11 +844,7 @@ check_xahau_wss_connection() {
         echo "  Ledger Range: $complete_ledgers"
         echo "  Server State: $server_state"
         
-        if [ "$server_state" == "full" ]; then
-            log_success "Xahau node is fully synced (server_state: full)"
-        else
-            log_error "Xahau node state: $server_state (MUST be 'full' to work properly)"
-        fi
+        evaluate_server_state "$server_state"
         return 0
     else
         log_error "Failed to connect to Xahau endpoint: $wss_endpoint"
@@ -728,6 +881,18 @@ check_evernode_accounts() {
         }
     fi
     
+    # Derive the JSON-RPC endpoint from the node's own configured
+    # rippledServer (wss://...  ->  https://...). check_xrpl_balance
+    # falls back to the public Xahau RPC if this is empty or unreachable.
+    local rpc_endpoint=""
+    if [ -f "/etc/sashimono/mb-xrpl/mb-xrpl.cfg" ]; then
+        local cfg_wss
+        cfg_wss=$(jq -r '.xrpl.rippledServer // empty' /etc/sashimono/mb-xrpl/mb-xrpl.cfg 2>/dev/null)
+        if [ -n "$cfg_wss" ]; then
+            rpc_endpoint="${cfg_wss//wss:/https:}"
+        fi
+    fi
+
     # Try to auto-detect accounts from multiple possible config locations
     evernode_configs=(
         "$HOME/.evernode/config.json"
@@ -768,14 +933,14 @@ check_evernode_accounts() {
     if [ $CRON_MODE -eq 1 ]; then
         if [ -n "$auto_host_account" ]; then
             echo "Using auto-detected host account: $auto_host_account"
-            check_xrpl_balance "$auto_host_account" "Host Account"
+            check_xrpl_balance "$auto_host_account" "Host Account" "$rpc_endpoint"
         else
             log_warning "Host account not auto-detected in cron mode, skipping host account check"
         fi
         
         if [ -n "$auto_rep_account" ]; then
             echo "Using auto-detected reputation account: $auto_rep_account"
-            check_xrpl_balance "$auto_rep_account" "Reputation Account"
+            check_xrpl_balance "$auto_rep_account" "Reputation Account" "$rpc_endpoint"
         else
             log_warning "Reputation account not auto-detected in cron mode, skipping reputation account check"
         fi
@@ -790,7 +955,7 @@ check_evernode_accounts() {
         fi
         
         if [ -n "$host_account" ]; then
-            check_xrpl_balance "$host_account" "Host Account"
+            check_xrpl_balance "$host_account" "Host Account" "$rpc_endpoint"
         else
             log_warning "Host account check skipped (RECOMMENDED to check)"
         fi
@@ -805,7 +970,7 @@ check_evernode_accounts() {
         fi
         
         if [ -n "$reputation_account" ]; then
-            check_xrpl_balance "$reputation_account" "Reputation Account"
+            check_xrpl_balance "$reputation_account" "Reputation Account" "$rpc_endpoint"
         else
             log_warning "Reputation account check skipped (RECOMMENDED to check)"
         fi
@@ -868,32 +1033,32 @@ check_evernode_logs() {
     fi
 }
 
-# Function to get port purpose/description
+# Evernode port base offsets (shared by calculate_required_ports and
+# get_port_purpose so they never drift apart).
+EVR_USER_PORT_BASE=22861   # 1 per instance: tenant WebSocket
+EVR_PEER_PORT_BASE=26201   # 1 per instance: Sashimono peer-to-peer
+EVR_TCP_PORT_BASE=36525    # 2 per instance: tenant instance TCP
+EVR_UDP_PORT_BASE=39064    # 2 per instance: tenant instance UDP
+
+# Function to get port purpose/description (range-based, instance-count agnostic)
 get_port_purpose() {
     local port=$1
-    case $port in
-        80)
-            echo "HTTP: Let's Encrypt validation, HTTP-to-HTTPS redirect"
-            ;;
-        443)
-            echo "HTTPS: SSL/TLS termination (reverse proxy)"
-            ;;
-        22861|22862|22863|22864|22865|22866|22867|22868|22869|22870)
-            echo "Evernode User Port: WebSocket connections from tenants"
-            ;;
-        26201|26202|26203|26204|26205|26206|26207|26208|26209|26210)
-            echo "Evernode Peer Port: Sashimono peer-to-peer communication"
-            ;;
-        36525|36526|36527|36528|36529|36530|36531|36532|36533|36534|36535|36536|36537|36538|36539|36540)
-            echo "Evernode TCP Port: Tenant instance TCP communication"
-            ;;
-        39064|39065|39066|39067|39068|39069|39070|39071|39072|39073|39074|39075|39076|39077|39078|39079|39080)
-            echo "Evernode UDP Port: Tenant instance UDP communication"
-            ;;
-        *)
-            echo "Unknown port"
-            ;;
+    case "$port" in
+        80)  echo "HTTP: Let's Encrypt validation, HTTP-to-HTTPS redirect"; return ;;
+        443) echo "HTTPS: SSL/TLS termination (reverse proxy)"; return ;;
     esac
+
+    if [ "$port" -ge "$EVR_USER_PORT_BASE" ] && [ "$port" -lt "$EVR_PEER_PORT_BASE" ]; then
+        echo "Evernode User Port: WebSocket connections from tenants"
+    elif [ "$port" -ge "$EVR_PEER_PORT_BASE" ] && [ "$port" -lt "$EVR_TCP_PORT_BASE" ]; then
+        echo "Evernode Peer Port: Sashimono peer-to-peer communication"
+    elif [ "$port" -ge "$EVR_TCP_PORT_BASE" ] && [ "$port" -lt "$EVR_UDP_PORT_BASE" ]; then
+        echo "Evernode TCP Port: Tenant instance TCP communication"
+    elif [ "$port" -ge "$EVR_UDP_PORT_BASE" ] && [ "$port" -lt $((EVR_UDP_PORT_BASE + 1000)) ]; then
+        echo "Evernode UDP Port: Tenant instance UDP communication"
+    else
+        echo "Unknown port"
+    fi
 }
 
 # Function to analyze port usage (firewall vs actual listeners)
@@ -991,14 +1156,15 @@ analyze_port_usage() {
     fi
 }
 
-# Function to calculate required ports
+# Function to calculate required ports.
+# User and peer ports: 1 per instance. TCP and UDP: 2 per instance.
 calculate_required_ports() {
     local instance_count=$1
-    user_ports=($(seq 22861 $((22861 + instance_count))))
-    peer_ports=($(seq 26201 $((26201 + instance_count))))
-    tcp_ports=($(seq 36525 $((36525 + instance_count * 2 - 1))))
-    udp_ports=($(seq 39064 $((39064 + instance_count * 2 - 1))))
-    all_ports=("${user_ports[@]}" "${peer_ports[@]}" "${tcp_ports[@]}" "80" "443")
+    user_ports=($(seq "$EVR_USER_PORT_BASE" $((EVR_USER_PORT_BASE + instance_count - 1))))
+    peer_ports=($(seq "$EVR_PEER_PORT_BASE" $((EVR_PEER_PORT_BASE + instance_count - 1))))
+    tcp_ports=($(seq "$EVR_TCP_PORT_BASE" $((EVR_TCP_PORT_BASE + instance_count * 2 - 1))))
+    udp_ports=($(seq "$EVR_UDP_PORT_BASE" $((EVR_UDP_PORT_BASE + instance_count * 2 - 1))))
+    all_ports=("${user_ports[@]}" "${peer_ports[@]}" "${tcp_ports[@]}" "${udp_ports[@]}" "80" "443")
     echo "${all_ports[@]}"
 }
 
@@ -1185,7 +1351,8 @@ main() {
     # Parse command-line arguments first
     parse_arguments "$@"
     
-    # Display ASCII art banner
+    # Display ASCII art banner (suppressed in JSON mode for clean output)
+    if [ $JSON_MODE -eq 0 ]; then
     echo ""
     print_color "$YELLOW" "
   ███████╗██╗   ██╗███████╗██████╗ ███╗   ██╗ ██████╗ ██████╗ ███████╗
@@ -1211,12 +1378,13 @@ main() {
 "
     
     print_color "$BLUE" "======================================"
-    print_color "$BLUE" "       Health Check v2.6"
+    print_color "$BLUE" "       Health Check v3.0"
     if [ $CRON_MODE -eq 1 ]; then
         print_color "$YELLOW" "          [CRON MODE]"
     fi
     print_color "$YELLOW" "====================================="
     echo ""
+    fi
     
     # Show available options (only in interactive mode)
     if [ $CRON_MODE -eq 0 ]; then
@@ -1433,7 +1601,20 @@ main() {
     
     # Check Evernode logs (intensive operation, runs last)
     check_evernode_logs
-    
+
+    # JSON mode: emit the machine-readable report and exit with the
+    # appropriate code, skipping the human-readable summary entirely.
+    if [ $JSON_MODE -eq 1 ]; then
+        print_json_report
+        if [ $HAS_ERRORS -eq 1 ]; then
+            exit 1
+        elif [ ${#WARNING_MESSAGES[@]} -gt 0 ]; then
+            exit 2
+        else
+            exit 0
+        fi
+    fi
+
     # Print summary report
     print_summary_report
     
@@ -1452,9 +1633,12 @@ main() {
         print_color "$GREEN" "   ${#SUCCESS_MESSAGES[@]} check(s) completed"
         if [ ${#WARNING_MESSAGES[@]} -gt 0 ]; then
             print_color "$YELLOW" "   ${#WARNING_MESSAGES[@]} warning(s) - optional improvements"
+            # Distinct exit code so monitoring can tell "clean" from
+            # "passing but with warnings".
+            exit 2
         fi
     fi
 }
 
 # Run main function
-main
+main "$@"
