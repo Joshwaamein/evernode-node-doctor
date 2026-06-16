@@ -1735,6 +1735,30 @@ check_protocol_level() {
         return 0
     fi
 
+    # Determine whether a contract instance is actually running. The
+    # HotPocket user-port listener only exists WHILE an instance/contract
+    # is running. The per-moment reputation contract is ephemeral, so a
+    # registered host with no active lease legitimately has no listener
+    # between moments. Probing then and erroring would be a false alarm.
+    local running=0
+    local db="/etc/sashimono/sa.sqlite"
+    if [ -f "$db" ]; then
+        if command -v sqlite3 >/dev/null 2>&1; then
+            running=$(sqlite3 "$db" "SELECT count(*) FROM instances WHERE status='running';" 2>/dev/null)
+        elif command -v python3 >/dev/null 2>&1; then
+            running=$(python3 - "$db" <<'PY' 2>/dev/null
+import sqlite3, sys
+try:
+    c = sqlite3.connect(sys.argv[1])
+    print(c.execute("SELECT count(*) FROM instances WHERE status='running'").fetchone()[0])
+except Exception:
+    print(0)
+PY
+)
+        fi
+    fi
+    [ -z "$running" ] && running=0
+
     # Prefer the real per-instance user_port from config over the base.
     local gp_port="$EVR_USER_PORT_BASE"
     local cfg
@@ -1749,6 +1773,12 @@ check_protocol_level() {
             fi
         fi
     done
+
+    if [ "$running" -lt 1 ]; then
+        log_info "No contract instance running, so no user-port listener is expected right now. The reputation contract is per-moment/ephemeral; this is normal for a registered host between leases. Skipping the live hairpin/GP probe"
+        echo "(Would have probed user port ${gp_port} at ${public_ip} if an instance were active.)"
+        return 0
+    fi
 
     echo "Probing user port ${gp_port} at public IP ${public_ip} (WAN hairpin path)"
     run_gp_probe "userport" "$public_ip" "$gp_port" "User-port TLS reachability (hairpin)"
