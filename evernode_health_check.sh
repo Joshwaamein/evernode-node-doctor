@@ -41,6 +41,8 @@ EXTERNAL_REFLECTOR="https://ports.yougetsignal.com/check-port.php"
 ONLEDGER_URL="https://api.onledger.net/host-test"
 REPORT_PATH=""
 GP_PROBE=1   # protocol-level checks via the Node helper (1=on, 0=off)
+QUIET=0      # only print warnings/errors and the summary
+HISTORY_FILE=""  # append a dated JSON summary line for trend tracking
 
 # Global error flag and tracking arrays
 HAS_ERRORS=0
@@ -94,6 +96,14 @@ parse_arguments() {
                 GP_PROBE=0
                 shift
                 ;;
+            --quiet)
+                QUIET=1
+                shift
+                ;;
+            --history)
+                HISTORY_FILE="$2"
+                shift 2
+                ;;
             --help|-h)
                 show_help
                 exit 0
@@ -137,6 +147,8 @@ Options:
   --report <path>     Write a shareable diagnostic report to <path>.
   --no-gp-probe       Skip the protocol-level Node checks (user-port TLS,
                       GP/HotPocket handshake).
+  --quiet             Only print warnings, errors, and the summary.
+  --history <path>    Append a dated JSON record (JSONL) for trend tracking.
   --help, -h          Show this help message
 
 End-to-end / external testing:
@@ -189,14 +201,14 @@ log_warning() {
 # Function to log success
 log_success() {
     local message=$1
-    print_color "$GREEN" "SUCCESS: $message"
+    [ "$QUIET" -eq 1 ] || print_color "$GREEN" "SUCCESS: $message"
     SUCCESS_MESSAGES+=("$message")
 }
 
 # Function to log info
 log_info() {
     local message=$1
-    print_color "$BLUE" "INFO: $message"
+    [ "$QUIET" -eq 1 ] || print_color "$BLUE" "INFO: $message"
 }
 
 # Function to print summary report
@@ -1787,6 +1799,39 @@ PY
 
 # Write a shareable, self-contained diagnostic report (Tier 1). Mirrors
 # the external tool's "downloadable report you can share with support".
+# Append a one-line dated JSON record to a history file for trend
+# tracking (reputation/balance/result drift over time). One JSON object
+# per line (JSONL), so it's easy to tail or graph.
+write_history() {
+    local path=$1
+    [ -z "$path" ] && return 0
+    command -v jq >/dev/null 2>&1 || return 0
+
+    local status="ok"
+    if [ "$HAS_ERRORS" -eq 1 ]; then status="error"
+    elif [ ${#WARNING_MESSAGES[@]} -gt 0 ]; then status="warning"; fi
+
+    # Pull a couple of trend-worthy live values if available.
+    local rep="" hostbal=""
+    if command -v evernode >/dev/null 2>&1; then
+        rep=$(evernode status 2>/dev/null | awk -F: '/^Reputation:/{print $2}' | xargs)
+    fi
+
+    jq -nc \
+        --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        --arg host "$(hostname 2>/dev/null || echo unknown)" \
+        --arg status "$status" \
+        --argjson s "${#SUCCESS_MESSAGES[@]}" \
+        --argjson w "${#WARNING_MESSAGES[@]}" \
+        --argjson e "${#ERROR_MESSAGES[@]}" \
+        --arg rep "${rep:-}" \
+        '{timestamp:$ts, host:$host, status:$status,
+          counts:{success:$s, warning:$w, error:$e},
+          reputation:(($rep|select(.!=""))|tonumber? // null)}' >> "$path" 2>/dev/null \
+        && [ "$QUIET" -eq 1 ] || log_success "History record appended: $path"
+}
+
+
 write_report() {
     local path=$1
     [ -z "$path" ] && return 0
@@ -1794,7 +1839,7 @@ write_report() {
         echo "Evernode Node Doctor diagnostic report"
         echo "Generated: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
         echo "Host: $(hostname 2>/dev/null || echo unknown)"
-        echo "Script version: v3.1"
+        echo "Script version: v3.2"
         echo ""
         echo "=== System ==="
         echo "Kernel: $(uname -sr 2>/dev/null)"
@@ -1832,13 +1877,254 @@ write_report() {
 }
 
 
+# === v3.2 additions: deeper Evernode health checks ===
+
+# Appliance cert vs served-cert serial mismatch. The Sashimono appliance
+# cert (/etc/sashimono/contract_template/cfg/tlscert.pem) is what secures
+# the mTLS peer/scoring path on the user port. If the LE leaf renews but
+# `evernode applyssl` is not re-run, the served cert drifts from the
+# on-disk appliance cert, peer mTLS fails, and the host silently stops
+# scoring (reputation degrades with no obvious cause). This catches it.
+check_appliance_cert_sync() {
+    print_color "$YELLOW" "\n=== Appliance Certificate Sync ==="
+    local appliance="/etc/sashimono/contract_template/cfg/tlscert.pem"
+    if [ ! -f "$appliance" ]; then
+        log_info "Appliance cert not found ($appliance); skipping cert-sync check"
+        return 0
+    fi
+    if ! command -v openssl >/dev/null 2>&1; then
+        log_warning "openssl not available; cannot compare cert serials"
+        return 1
+    fi
+
+    local appliance_serial
+    appliance_serial=$(openssl x509 -in "$appliance" -noout -serial 2>/dev/null | cut -d= -f2)
+    if [ -z "$appliance_serial" ]; then
+        log_warning "Could not read appliance cert serial"
+        return 1
+    fi
+    echo "Appliance cert serial: $appliance_serial"
+
+    # Compare against the cert actually served on the user port (the live
+    # mTLS scoring path). Prefer the configured user_port; fall back to base.
+    local user_port="$EVR_USER_PORT_BASE"
+    local cfg p
+    for cfg in /etc/sashimono/reputationd/reputationd.cfg /etc/sashimono/mb-xrpl/mb-xrpl.cfg; do
+        if [ -f "$cfg" ]; then
+            p=$(jq -r '.contractInstance.user_port // empty' "$cfg" 2>/dev/null)
+            [ -n "$p" ] && { user_port="$p"; break; }
+        fi
+    done
+
+    local served_serial
+    served_serial=$(echo | timeout 10 openssl s_client -connect "127.0.0.1:${user_port}" 2>/dev/null \
+        | openssl x509 -noout -serial 2>/dev/null | cut -d= -f2)
+
+    if [ -z "$served_serial" ]; then
+        log_info "No cert served on user port ${user_port} (no instance running right now); cannot live-compare. The on-disk appliance cert is present"
+        return 0
+    fi
+    echo "Served cert serial (port ${user_port}): $served_serial"
+
+    if [ "$appliance_serial" = "$served_serial" ]; then
+        log_success "Appliance cert matches the served cert (mTLS scoring path is in sync)"
+    else
+        log_error "Appliance cert serial does NOT match the served cert. Peer mTLS will fail and reputation will degrade. Fix: re-run 'evernode applyssl <privkey> <cert> <fullchain>' (or the SSL-distribution playbook)"
+    fi
+}
+
+# Evernode install age + version. A long-stale install can miss a
+# protocol-required update (mb-xrpl hook-rejections). Read-only.
+check_evernode_version() {
+    print_color "$YELLOW" "\n=== Evernode Version / Install Age ==="
+    local ts_file="/etc/sashimono/installer.version.timestamp"
+    local ver
+    ver=$(jq -r '.version // empty' /etc/sashimono/mb-xrpl/mb-xrpl.cfg 2>/dev/null)
+    [ -n "$ver" ] && echo "Sashimono config version: $ver"
+
+    if [ -f "$ts_file" ]; then
+        local ts ts_epoch now_epoch age_days
+        ts=$(cat "$ts_file" 2>/dev/null)
+        echo "Installed: $ts"
+        ts_epoch=$(date -d "$ts" +%s 2>/dev/null)
+        now_epoch=$(date +%s)
+        if [ -n "$ts_epoch" ]; then
+            age_days=$(( (now_epoch - ts_epoch) / 86400 ))
+            echo "Install age: ${age_days} days"
+            if [ "$age_days" -gt 180 ]; then
+                log_warning "Evernode install is ${age_days} days old. Review the upstream changelog and consider 'evernode update' (one host at a time, verify reputation between each)"
+            else
+                log_success "Evernode install age is reasonable (${age_days} days)"
+            fi
+        fi
+    else
+        log_info "No install timestamp found; cannot assess update age"
+    fi
+    echo "Tip: run 'evernode update' to check for and apply newer releases (read the changelog first)."
+}
+
+
+# Host heartbeat / registration freshness. mb-xrpl heartbeats keep the
+# host's on-chain registration alive; if it stops, the host ages out and
+# deregisters. We surface the live host status explicitly.
+check_heartbeat_status() {
+    print_color "$YELLOW" "\n=== Host Heartbeat / Registration ==="
+    if ! command -v evernode >/dev/null 2>&1; then
+        log_warning "Evernode CLI not available; cannot read host status"
+        return 1
+    fi
+    local status_out host_status
+    status_out=$(evernode status 2>/dev/null)
+    host_status=$(echo "$status_out" | grep -i '^Host status:' | awk -F: '{print $2}' | xargs)
+
+    case "$host_status" in
+        active)
+            log_success "Host registration is active (heartbeats accepted on-chain)"
+            ;;
+        inactive)
+            log_warning "Host status is INACTIVE. It re-activates on the next successful heartbeat; if it persists, mb-xrpl may be failing (check journal for sashimono-mb-xrpl)"
+            ;;
+        "")
+            log_warning "Could not read Host status from 'evernode status'"
+            ;;
+        *)
+            log_info "Host status: $host_status"
+            ;;
+    esac
+}
+
+# DDNS health. If the dynamic-DNS updater stops, the domain points at a
+# stale public IP and peers can't reach the host.
+check_ddns_health() {
+    print_color "$YELLOW" "\n=== Dynamic DNS Health ==="
+    local ddns_log="/var/log/cloudflare_ddns.log"
+    local ddns_script="/usr/local/sbin/cloudflare_ddns.sh"
+
+    if [ ! -f "$ddns_script" ] && [ ! -f "$ddns_log" ]; then
+        log_info "No DDNS script/log found; skipping (host may use static DNS)"
+        return 0
+    fi
+
+    if [ -f "$ddns_log" ]; then
+        local last_line last_epoch now_epoch age_min last_ts
+        last_line=$(tail -1 "$ddns_log" 2>/dev/null)
+        echo "Last DDNS log: $last_line"
+        last_ts=$(echo "$last_line" | grep -oE '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]+' | head -1)
+        if [ -n "$last_ts" ]; then
+            last_epoch=$(date -d "$last_ts" +%s 2>/dev/null)
+            now_epoch=$(date +%s)
+            if [ -n "$last_epoch" ]; then
+                age_min=$(( (now_epoch - last_epoch) / 60 ))
+                if [ "$age_min" -le 30 ]; then
+                    log_success "DDNS updated recently (${age_min} min ago)"
+                else
+                    log_warning "DDNS last ran ${age_min} min ago (expected ~15 min cadence). The updater may be stalled"
+                fi
+            fi
+        fi
+        if tail -20 "$ddns_log" 2>/dev/null | grep -qiE 'error|fail|denied|invalid'; then
+            log_warning "Recent DDNS log lines contain errors. Inspect: tail -20 $ddns_log"
+        fi
+    else
+        log_info "DDNS script present but no log yet"
+    fi
+}
+
+
+# xahaud connection depth: peer count and contiguous ledger range, via
+# the configured rippledServer (https form).
+check_xahaud_depth() {
+    print_color "$YELLOW" "\n=== Xahau Node Depth (peers / ledgers) ==="
+    local wss="" https_ep
+    if [ -f /etc/sashimono/mb-xrpl/mb-xrpl.cfg ]; then
+        wss=$(jq -r '.xrpl.rippledServer // empty' /etc/sashimono/mb-xrpl/mb-xrpl.cfg 2>/dev/null)
+    fi
+    [ -z "$wss" ] && { log_info "No rippledServer configured; skipping depth check"; return 0; }
+    https_ep="${wss//wss:/https:}"
+
+    local resp peers ledgers
+    resp=$(curl -s -X POST "$https_ep" -H "Content-Type: application/json" \
+        --connect-timeout 10 --max-time 15 \
+        -d '{"method":"server_info","params":[{}]}' 2>/dev/null)
+    [ -z "$resp" ] && { log_info "Could not reach $https_ep for depth check"; return 0; }
+
+    peers=$(echo "$resp" | jq -r '.result.info.peers // empty' 2>/dev/null)
+    ledgers=$(echo "$resp" | jq -r '.result.info.complete_ledgers // empty' 2>/dev/null)
+    [ -n "$ledgers" ] && echo "Complete ledgers: $ledgers"
+    if [ -n "$peers" ] && [[ "$peers" =~ ^[0-9]+$ ]]; then
+        echo "Peers: $peers"
+        if [ "$peers" -ge 8 ]; then
+            log_success "Xahau node has a healthy peer count ($peers)"
+        else
+            log_warning "Xahau node peer count is low ($peers, expect >= 8). Connectivity may be degraded"
+        fi
+    else
+        log_info "Peer count not reported (endpoint may be a proxy that strips it)"
+    fi
+}
+
+# Time sync. Consensus is clock-sensitive; a skewed clock can cause
+# subtle scoring/handshake failures that look like network issues.
+check_time_sync() {
+    print_color "$YELLOW" "\n=== Time Synchronisation ==="
+    if command -v timedatectl >/dev/null 2>&1; then
+        local synced
+        synced=$(timedatectl show -p NTPSynchronized --value 2>/dev/null)
+        echo "System time (UTC): $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        if [ "$synced" = "yes" ]; then
+            log_success "System clock is NTP-synchronised"
+        else
+            log_warning "System clock is NOT NTP-synchronised. Enable with: timedatectl set-ntp true"
+        fi
+    else
+        log_info "timedatectl not available; cannot verify time sync"
+    fi
+}
+
+# Rootless-Docker support stack. Rolling Docker out of step with
+# slirp4netns has caused per-instance contract crashes. Note: modern
+# kernels (5.11+) support native unprivileged overlayfs, so
+# fuse-overlayfs is NOT required and its absence is not a fault; only
+# the network shim (slirp4netns / rootlesskit) is load-bearing.
+check_rootless_docker_stack() {
+    print_color "$YELLOW" "\n=== Rootless Docker Support Stack ==="
+    local sashi_dir="/usr/bin/sashimono/dockerbin"
+    if [ ! -d "$sashi_dir" ] && ! command -v slirp4netns >/dev/null 2>&1; then
+        log_info "No Sashimono dockerbin and no system slirp4netns; skipping (not a standard Evernode host)"
+        return 0
+    fi
+
+    # Network shim is required for rootless Docker port mapping.
+    local net_ok=0 tool
+    for tool in slirp4netns rootlesskit; do
+        if command -v "$tool" >/dev/null 2>&1 || [ -x "$sashi_dir/$tool" ]; then
+            echo "  $tool: present"
+            net_ok=1
+        fi
+    done
+
+    # fuse-overlayfs is optional (native overlay covers it on modern kernels).
+    if command -v fuse-overlayfs >/dev/null 2>&1 || [ -x "$sashi_dir/fuse-overlayfs" ]; then
+        echo "  fuse-overlayfs: present"
+    else
+        echo "  fuse-overlayfs: not present (fine on kernels with native rootless overlayfs)"
+    fi
+
+    if [ "$net_ok" -eq 1 ]; then
+        log_success "Rootless Docker network shim present (slirp4netns / rootlesskit)"
+    else
+        log_warning "No rootless Docker network shim (slirp4netns / rootlesskit) found. Rootless Docker port mapping may be broken; align Docker upgrades with 'evernode update'"
+    fi
+}
+
+
 # Main script execution
 main() {
     # Parse command-line arguments first
     parse_arguments "$@"
     
-    # Display ASCII art banner (suppressed in JSON mode for clean output)
-    if [ $JSON_MODE -eq 0 ]; then
+    # Display ASCII art banner (suppressed in JSON and quiet modes)
+    if [ $JSON_MODE -eq 0 ] && [ $QUIET -eq 0 ]; then
     echo ""
     print_color "$YELLOW" "
   ███████╗██╗   ██╗███████╗██████╗ ███╗   ██╗ ██████╗ ██████╗ ███████╗
@@ -1864,7 +2150,7 @@ main() {
 "
     
     print_color "$BLUE" "======================================"
-    print_color "$BLUE" "       Health Check v3.1"
+    print_color "$BLUE" "       Health Check v3.2"
     if [ $CRON_MODE -eq 1 ]; then
         print_color "$YELLOW" "          [CRON MODE]"
     fi
@@ -2088,6 +2374,15 @@ main() {
     # Instance slot / zombie detection (read-only).
     check_instance_slots
 
+    # === v3.2 deeper health checks ===
+    check_appliance_cert_sync
+    check_heartbeat_status
+    check_xahaud_depth
+    check_time_sync
+    check_rootless_docker_stack
+    check_ddns_health
+    check_evernode_version
+
     # External port reachability (opt-in via --external).
     check_external_reachability "$domain_name" "${required_ports[@]:-}"
 
@@ -2115,6 +2410,7 @@ main() {
     # Write a shareable diagnostic report if requested (captures all
     # results gathered above). Done before any exit path.
     write_report "$REPORT_PATH"
+    write_history "$HISTORY_FILE"
 
     # JSON mode: emit the machine-readable report and exit with the
     # appropriate code, skipping the human-readable summary entirely.

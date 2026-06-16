@@ -3,6 +3,35 @@
 ## Overview
 The **Evernode Node Doctor** is a comprehensive, one-stop validation tool that verifies all requirements for running an Evernode node are properly met. This bash script performs exhaustive checks across system resources, Docker infrastructure, network configuration, security settings, and XRPL account balances to ensure your Evernode host is production-ready.
 
+## ✨ New in v3.2
+
+Deeper Evernode-specific health checks (validated against a live
+registered host), plus packaging:
+
+- **Appliance certificate sync** — compares the Sashimono appliance cert
+  on disk against the cert actually served on the user port. A serial
+  mismatch means peer mTLS will fail and reputation will silently
+  degrade (the classic "why did my reputation drop" cause). The standout
+  new check.
+- **Host heartbeat / registration** — explicit active/inactive verdict.
+- **Xahau node depth** — peer count (warns below 8) and ledger range,
+  beyond the existing `server_state: full` check.
+- **Time synchronisation** — consensus is clock-sensitive; warns if NTP
+  is not synced.
+- **Rootless Docker support stack** — confirms the network shim
+  (slirp4netns / rootlesskit). `fuse-overlayfs` is treated as optional
+  (modern kernels use native rootless overlayfs).
+- **Dynamic DNS health** — checks the DDNS log for recent activity and
+  errors (stale DNS = peers can't reach you).
+- **Evernode install age** — warns if the install is very old (a stale
+  install can miss a protocol-required update).
+- **`--quiet`** — print only warnings, errors, and the summary.
+- **`--history <path>`** — append a dated JSON record (JSONL) per run for
+  reputation/result trend tracking.
+- **`install.sh`** — one-line installer:
+  `curl -fsSL https://raw.githubusercontent.com/Joshwaamein/evernode-node-doctor/main/install.sh | sudo bash`
+  (set `ADD_CRON=1` to also add a daily check).
+
 ## ✨ New in v3.1
 
 End-to-end and diagnostic additions, complementary to the external
@@ -294,6 +323,8 @@ sudo ./evernode_health_check.sh --cron --no-color --skip-accounts
 --reflector <url>   Override the external reflector endpoint
 --report <path>     Write a shareable diagnostic report to <path>
 --no-gp-probe       Skip the protocol-level Node checks (user-port TLS, GP/HotPocket handshake)
+--quiet             Only print warnings, errors, and the summary
+--history <path>    Append a dated JSON record (JSONL) for trend tracking
 --help, -h          Show this help message
 ```
 
@@ -856,7 +887,22 @@ If this project is useful to you, consider supporting it:
 
 ## Changelog
 
-### Version 3.1 (Current)
+### Version 3.2 (Current)
+- Validated against a live registered host. New Evernode-specific checks:
+  - **Appliance cert sync**: appliance cert on disk vs cert served on the
+    user port; a mismatch silently kills reputation (mTLS scoring path).
+  - **Host heartbeat / registration** active/inactive verdict.
+  - **Xahau node depth**: peer count (warns < 8) and ledger range.
+  - **Time sync** (NTP) check.
+  - **Rootless Docker support stack**: requires slirp4netns/rootlesskit;
+    `fuse-overlayfs` is optional (native rootless overlayfs covers it).
+  - **DDNS health**: recent activity + error scan of the DDNS log.
+  - **Evernode install age** warning for very old installs.
+- **`--quiet`** (warnings/errors/summary only), **`--history <path>`**
+  (append a dated JSONL record for trend tracking).
+- **`install.sh`** one-line installer (optional daily cron via `ADD_CRON=1`).
+
+### Version 3.1
 - **Validated end-to-end against a live registered Evernode host** and
   corrected the assumptions that integration testing disproved:
   - Reputation opt-in now reads `evernode reputationd status` (JSON), not
