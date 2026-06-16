@@ -62,8 +62,15 @@ function probeUserPort(host, port, timeout) {
     tcp.once('connect', () => {
       tcpDone = true;
       tcp.destroy();
+      // SNI servername must be a hostname, not an IP (RFC 6066). Only
+      // set it when host is not an IPv4/IPv6 literal, to avoid a Node
+      // deprecation warning on the WAN-hairpin (IP) probe.
+      const tlsOpts = { host, port, timeout, rejectUnauthorized: false };
+      if (net.isIP(host) === 0) {
+        tlsOpts.servername = host;
+      }
       const socket = tls.connect(
-        { host, port, timeout, rejectUnauthorized: false, servername: host },
+        tlsOpts,
         () => {
           const cert = socket.getPeerCertificate();
           result.status = 'pass';

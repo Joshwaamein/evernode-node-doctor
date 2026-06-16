@@ -857,6 +857,22 @@ If this project is useful to you, consider supporting it:
 ## Changelog
 
 ### Version 3.1 (Current)
+- **Validated end-to-end against a live registered Evernode host** and
+  corrected the assumptions that integration testing disproved:
+  - Reputation opt-in now reads `evernode reputationd status` (JSON), not
+    a non-existent line in `evernode status`.
+  - Instance-slot zombie detection no longer relies on root `docker ps`
+    (Evernode uses rootless per-user Docker, invisible to root). It now
+    reads `sa.sqlite` via `sqlite3` OR `python3` and confirms liveness via
+    the HotPocket listener/process on each instance's user_port.
+  - Protocol-level probe reads the real per-instance `user_port` from
+    config; the user-port TLS hairpin check is confirmed working.
+  - Fixed false-positive ERRORs that made a healthy host report failures:
+    Docker (detect rootless Sashimono docker + agent), netstat (treat
+    `ss` as equivalent), websocat (optional, info not error), and RAM
+    (recommendation/warning, not a hard error).
+  - `gp-probe.js`: skip SNI servername for IP hosts (RFC 6066) to silence
+    a Node TLS deprecation warning.
 - **End-to-end / diagnostic additions** inspired by the external
   community tester (https://api.onledger.net/host-test), kept honest for
   an on-host tool:

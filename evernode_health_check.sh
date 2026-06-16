@@ -354,7 +354,7 @@ check_system_requirements() {
     if (( $(echo "$total_ram_gb >= 8" | bc -l) )); then
         log_success "RAM meets requirements (${total_ram_gb} GB, minimum 8 GB recommended)"
     else
-        log_error "RAM below minimum requirements (${total_ram_gb} GB, minimum 8 GB recommended)"
+        log_warning "RAM below the recommended 8 GB (${total_ram_gb} GB). Many hosts run on less; this is a recommendation, not a hard requirement"
     fi
     
     if (( $(echo "$available_ram_gb < 2" | bc -l) )); then
@@ -399,23 +399,56 @@ check_system_uptime() {
 # Function to check Docker status and version
 check_docker_status() {
     print_color "$YELLOW" "\n=== Docker Status Check ==="
-    
-    if ! check_command "docker"; then
-        log_error "Docker is not installed (REQUIRED for Evernode)"
-        echo "Install with: apt-get update && apt-get install -y docker.io"
+
+    # Evernode/Sashimono runs Docker ROOTLESS under each per-instance
+    # sashi<n> user, so a root-level `docker` may legitimately be absent
+    # on a perfectly healthy host. Detect the Sashimono rootless docker
+    # and the agent service before declaring Docker missing.
+    local sashi_docker="/usr/bin/sashimono/dockerbin/docker"
+    local have_root_docker=0 have_sashi_docker=0 have_agent=0
+    command -v docker >/dev/null 2>&1 && have_root_docker=1
+    [ -x "$sashi_docker" ] && have_sashi_docker=1
+    systemctl is-active --quiet sashimono-agent.service 2>/dev/null && have_agent=1
+
+    if [ "$have_root_docker" -eq 0 ] && [ "$have_sashi_docker" -eq 0 ]; then
+        if [ "$have_agent" -eq 1 ]; then
+            log_warning "No root or Sashimono docker binary found, but sashimono-agent is active. Unusual; verify the install"
+        else
+            log_error "Docker is not installed (REQUIRED for Evernode)"
+            echo "Install with: apt-get update && apt-get install -y docker.io"
+        fi
         return 1
     fi
-    
-    # Check Docker version
+
+    if [ "$have_sashi_docker" -eq 1 ] && [ "$have_root_docker" -eq 0 ]; then
+        # Standard Evernode host: rootless Docker + active agent.
+        local sashi_ver
+        sashi_ver=$("$sashi_docker" --version 2>/dev/null | awk '{print $3}' | sed 's/,//')
+        echo "Docker (Sashimono rootless): ${sashi_ver:-detected}"
+        if [ "$have_agent" -eq 1 ]; then
+            log_success "Sashimono agent active; rootless Docker in use (this is the normal Evernode setup)"
+        else
+            log_warning "Sashimono rootless docker present but sashimono-agent.service is not active"
+        fi
+        return 0
+    fi
+
+    # Root-level docker is present: continue with the original checks.
     docker_version=$(docker --version 2>/dev/null | awk '{print $3}' | sed 's/,//')
     echo "Docker Version: $docker_version"
-    
+
     if ! systemctl is-active --quiet docker; then
+        # On a host that also runs the Sashimono agent, the root docker
+        # daemon being down is not necessarily fatal to Evernode.
+        if [ "$have_agent" -eq 1 ]; then
+            log_warning "Root Docker daemon not active, but sashimono-agent is (Evernode uses rootless Docker)"
+            return 0
+        fi
         log_error "Docker service is not running (CRITICAL)"
         echo "Start with: systemctl start docker && systemctl enable docker"
         return 1
     fi
-    
+
     log_success "Docker service is running"
     
     # Check Docker containers
@@ -528,15 +561,16 @@ check_ssh_security() {
 check_open_ports_security() {
     print_color "$YELLOW" "\n=== Open Ports Security Analysis ==="
     
-    if ! check_command "netstat"; then
-        if ! check_command "ss"; then
-            log_error "Neither netstat nor ss is available for port checking"
-            return 1
-        fi
-        # Use ss instead of netstat
+    # Prefer ss (modern, present on most hosts); fall back to netstat.
+    # Only error if neither exists. Use command -v to avoid logging a
+    # spurious "netstat not installed" error on ss-only hosts.
+    if command -v ss >/dev/null 2>&1; then
         listening_ports=$(ss -tuln | grep LISTEN | awk '{print $5}' | sed 's/.*://' | sort -u)
-    else
+    elif command -v netstat >/dev/null 2>&1; then
         listening_ports=$(netstat -tuln | grep LISTEN | awk '{print $4}' | sed 's/.*://' | sort -u)
+    else
+        log_error "Neither ss nor netstat is available for port checking"
+        return 1
     fi
     
     echo "Currently listening ports:"
@@ -803,8 +837,10 @@ check_xahau_wss_connection() {
     
     echo "Configured Xahau WSS Endpoint: $wss_endpoint"
     
-    # Method 1: Try websocat (preferred - safe, no npm conflicts)
-    if check_command "websocat"; then
+    # Method 1: Try websocat (preferred - safe, no npm conflicts).
+    # websocat is optional with an HTTPS fallback below, so its absence
+    # is informational, not an error.
+    if command -v websocat >/dev/null 2>&1; then
         echo "Testing WebSocket connection with websocat..."
         wss_response=$(echo '{"command":"server_info"}' | timeout 10 websocat -n1 "$wss_endpoint" 2>&1)
         
@@ -1103,15 +1139,14 @@ analyze_port_usage() {
     print_color "$YELLOW" "\n=== Port Usage Analysis ==="
     echo "Analyzing which ports are open in firewall vs actually listening..."
     
-    # Get currently listening ports
-    if ! check_command "netstat"; then
-        if ! check_command "ss"; then
-            log_error "Neither netstat nor ss is available for port checking"
-            return 1
-        fi
+    # Get currently listening ports (prefer ss, fall back to netstat).
+    if command -v ss >/dev/null 2>&1; then
         listening_ports=$(ss -tuln | grep LISTEN | awk '{print $5}' | sed 's/.*://' | sort -u)
-    else
+    elif command -v netstat >/dev/null 2>&1; then
         listening_ports=$(netstat -tuln | grep LISTEN | awk '{print $4}' | sed 's/.*://' | sort -u)
+    else
+        log_error "Neither ss nor netstat is available for port checking"
+        return 1
     fi
     
     # Get UFW allowed ports
@@ -1138,9 +1173,9 @@ analyze_port_usage() {
                 if echo "$listening_ports" | grep -q "^${port}$"; then
                     listening_status="YES"
                     # Try to get the process name
-                    if check_command "netstat"; then
+                    if command -v netstat >/dev/null 2>&1; then
                         listening_process=$(sudo netstat -tulnp 2>/dev/null | grep ":${port} " | awk '{print $7}' | cut -d'/' -f2 | head -1)
-                    elif check_command "ss"; then
+                    elif command -v ss >/dev/null 2>&1; then
                         listening_process=$(sudo ss -tulnp 2>/dev/null | grep ":${port} " | grep -oP 'users:\(\(".*?"\)' | sed 's/users:(("//' | sed 's/".*//' | head -1)
                     fi
                 fi
@@ -1408,29 +1443,43 @@ check_virtualisation() {
     fi
 }
 
-# Function to surface reputation contract opt-in as its own PASS/FAIL
-# line rather than leaving it buried in raw 'evernode status' output.
+# Function to surface reputation opt-in status as its own PASS/FAIL line.
+# The authoritative source is `evernode reputationd status`, which prints
+# a JSON blob (hostAddress, score, scoreNumerator/Denominator, ...) when
+# opted in. `evernode status` only shows the Reputation score, not opt-in.
 check_reputation_optin() {
-    print_color "$YELLOW" "\n=== Reputation Contract Opt-In ==="
+    print_color "$YELLOW" "\n=== Reputation Opt-In ==="
     if ! check_command "evernode"; then
         log_warning "Evernode CLI not available; cannot read reputation opt-in"
         return 1
     fi
-    local status_out
-    status_out=$(evernode status 2>/dev/null)
-    if [ -z "$status_out" ]; then
-        log_warning "Unable to read 'evernode status' for reputation opt-in"
+    local rep_out
+    rep_out=$(evernode reputationd status 2>/dev/null)
+    if [ -z "$rep_out" ]; then
+        log_warning "Unable to read 'evernode reputationd status'"
         return 1
     fi
-    # The CLI prints a line indicating reputation participation. Match
-    # common phrasings without assuming a single exact string.
-    if echo "$status_out" | grep -qiE 'reputation.*(opt|enabled|active|participat)'; then
-        local rep_line
-        rep_line=$(echo "$status_out" | grep -iE 'reputation' | head -2)
-        echo "$rep_line"
-        log_success "Reputation contract opt-in appears active"
+
+    # Opted-in hosts emit a JSON object containing a host reputation
+    # account and a score. Extract from the first '{' to the last '}'
+    # (the block is multi-line with nested braces) and parse with jq.
+    local rep_json score host_addr
+    # Extract the JSON object: from the first line starting with '{' to the
+    # first line that is exactly '}' (the top-level close). Trailing lines
+    # like REPUTATIOND_SUCCESS and prose must be excluded or jq rejects it.
+    rep_json=$(echo "$rep_out" | awk '/^\{/{f=1} f{print} /^\}/{exit}')
+    if [ -n "$rep_json" ] && echo "$rep_json" | jq -e . >/dev/null 2>&1; then
+        score=$(echo "$rep_json" | jq -r '.score // empty' 2>/dev/null)
+        host_addr=$(echo "$rep_json" | jq -r '.hostAddress // empty' 2>/dev/null)
+        echo "Reputation host address: ${host_addr:-unknown}"
+        echo "Per-moment score: ${score:-unknown}"
+        log_success "Reputation opt-in is ACTIVE (reward distribution enabled)"
+    elif echo "$rep_out" | grep -qiE 'opt[- ]?out|not opted'; then
+        log_warning "Reputation appears OPTED OUT. To earn reward distribution: evernode reputationd opt-in"
     else
-        log_warning "Reputation opt-in not detected in 'evernode status'. If you expect to earn reputation rewards, opt in with the Evernode CLI"
+        # Reachable but unparseable: show the delegate line if present.
+        echo "$rep_out" | grep -iE 'reputation|delegate|address' | head -2
+        log_info "Reputation status retrieved but opt-in state could not be parsed definitively"
     fi
 }
 
@@ -1445,41 +1494,68 @@ check_instance_slots() {
         log_info "Sashimono instance DB not found ($db); skipping slot check"
         return 0
     fi
-    if ! check_command "sqlite3"; then
-        log_warning "sqlite3 not installed; cannot inspect instance slots. Install with: apt-get install -y sqlite3"
-        return 1
-    fi
-    if ! check_command "docker"; then
-        log_warning "docker not available; cannot cross-check instance containers"
+
+    # Read instance name + user_port from sa.sqlite. sqlite3 is often
+    # absent on Evernode hosts, so fall back to python3 (always present).
+    # Output one "name|user_port" per running instance.
+    local rows=""
+    if command -v sqlite3 >/dev/null 2>&1; then
+        rows=$(sqlite3 "$db" "SELECT name||'|'||user_port FROM instances WHERE status='running';" 2>/dev/null)
+    elif command -v python3 >/dev/null 2>&1; then
+        rows=$(python3 - "$db" <<'PY' 2>/dev/null
+import sqlite3, sys
+try:
+    c = sqlite3.connect(sys.argv[1])
+    for name, port in c.execute("SELECT name, user_port FROM instances WHERE status='running'"):
+        print(f"{name}|{port}")
+except Exception:
+    pass
+PY
+)
+    else
+        log_warning "Neither sqlite3 nor python3 available; cannot inspect instance slots"
         return 1
     fi
 
-    # Names marked running in the DB.
-    local db_running
-    db_running=$(sqlite3 "$db" "SELECT name FROM instances WHERE status='running';" 2>/dev/null | sort -u)
-    # Names of actual running containers.
-    local docker_running
-    docker_running=$(docker ps --format '{{.Names}}' --no-trunc 2>/dev/null | sort -u)
-
-    if [ -z "$db_running" ]; then
+    if [ -z "$rows" ]; then
         log_success "No instances marked running in sa.sqlite (no zombie slots)"
         return 0
     fi
 
-    local zombies=0
-    local name
-    while IFS= read -r name; do
+    # Liveness signal: a real instance has an hpcore/hpws process and a
+    # listener on its user_port. Sashimono runs rootless Docker per the
+    # sashi<n> user, so root's 'docker ps' sees nothing; we use the host
+    # process table and listening sockets instead (both root-visible).
+    local listeners=""
+    if command -v ss >/dev/null 2>&1; then
+        listeners=$(ss -tlnH 2>/dev/null | awk '{print $4}' | sed 's/.*://')
+    fi
+    local hp_procs
+    hp_procs=$(ps -eo args 2>/dev/null | grep -E 'hpcore|hpws' | grep -v grep)
+
+    local zombies=0 live=0 name port
+    while IFS='|' read -r name port; do
         [ -z "$name" ] && continue
-        if ! echo "$docker_running" | grep -qxF "$name"; then
-            log_error "Zombie slot: '$name' is 'running' in sa.sqlite but has no Docker container. This consumes an instance slot and can collapse reputation"
+        local ok=0
+        # A listener on the instance's user_port is the strongest signal.
+        if [ -n "$port" ] && echo "$listeners" | grep -qx "$port"; then
+            ok=1
+        # Otherwise accept a matching hpws port reference.
+        elif [ -n "$port" ] && echo "$hp_procs" | grep -q -- "--port $port"; then
+            ok=1
+        fi
+        if [ "$ok" -eq 1 ]; then
+            live=$((live + 1))
+        else
+            log_error "Possible zombie slot: instance '$name' (user_port ${port:-?}) is 'running' in sa.sqlite but no HotPocket listener/process is bound to its port. A stale slot consumes capacity and can collapse reputation"
             zombies=$((zombies + 1))
         fi
-    done <<< "$db_running"
+    done <<< "$rows"
 
     if [ "$zombies" -eq 0 ]; then
-        log_success "All 'running' instance rows have a backing container (no zombies)"
+        log_success "All $live running instance(s) have a live HotPocket listener (no zombies)"
     else
-        echo "Fix: stop the agent, remove the stale row, rm the orphan home dir, restart the agent. Verify with 'evernode list'. Do not DELETE rows blindly while the agent is live."
+        echo "Fix: stop the agent, remove the stale row from sa.sqlite, rm the orphan home dir, restart the agent. Verify with 'evernode list'. Do not DELETE rows while the agent is live."
     fi
 }
 
@@ -1589,6 +1665,12 @@ run_gp_probe() {
 # Tier 3 orchestrator: user-port TLS hairpin (via own public IP, the way
 # reputationd reaches its listener) and the real GP handshake when the
 # Evernode client lib is present.
+#
+# Note on the GP handshake: on a standard Sashimono host the HotPocket
+# client lib is webpacked into the daemons and not importable, so the
+# 'gp' probe normally SKIPs. The user-port TLS probe is the real,
+# always-available on-host signal. For the full peer-visa/GP handshake,
+# use the external onledger.net host-test.
 check_protocol_level() {
     local public_ip=$1
     print_color "$YELLOW" "\n=== Protocol-Level Checks (user port / GP handshake) ==="
@@ -1596,8 +1678,23 @@ check_protocol_level() {
         log_info "No public IP resolved; skipping protocol-level checks"
         return 0
     fi
-    local gp_port=$EVR_PEER_PORT_BASE
-    echo "Probing user/GP port ${gp_port} at public IP ${public_ip} (WAN hairpin path)"
+
+    # Prefer the real per-instance user_port from config over the base.
+    local gp_port="$EVR_USER_PORT_BASE"
+    local cfg
+    for cfg in /etc/sashimono/reputationd/reputationd.cfg \
+               /etc/sashimono/mb-xrpl/mb-xrpl.cfg; do
+        if [ -f "$cfg" ]; then
+            local p
+            p=$(jq -r '.contractInstance.user_port // empty' "$cfg" 2>/dev/null)
+            if [ -n "$p" ]; then
+                gp_port="$p"
+                break
+            fi
+        fi
+    done
+
+    echo "Probing user port ${gp_port} at public IP ${public_ip} (WAN hairpin path)"
     run_gp_probe "userport" "$public_ip" "$gp_port" "User-port TLS reachability (hairpin)"
     run_gp_probe "gp" "$public_ip" "$gp_port" "GP / HotPocket peer handshake"
 }
@@ -1835,14 +1932,16 @@ main() {
         # Instance count and port configuration
         print_color "$YELLOW" "\n=== Instance Count Detection ==="
         
-        # Try to auto-detect instance count from running containers
+        # Try to auto-detect instance count from running containers.
+        # Use the host process table (rootless-Docker safe) rather than
+        # root 'docker', which is absent on a normal Evernode host.
         auto_instance_count=0
-        if check_command "docker" &>/dev/null; then
+        if command -v docker >/dev/null 2>&1; then
             auto_instance_count=$(docker ps --filter "name=sashi" --format "{{.Names}}" 2>/dev/null | wc -l)
         fi
-        
+
         # Alternative: try to parse from evernode status
-        if [ "$auto_instance_count" -eq 0 ] && check_command "evernode" &>/dev/null; then
+        if [ "$auto_instance_count" -eq 0 ] && command -v evernode >/dev/null 2>&1; then
             evernode_status_output=$(evernode status 2>/dev/null)
             if [ -n "$evernode_status_output" ]; then
                 # Look for "Available Lease offers: X out of Y" pattern and extract Y (total instances)
