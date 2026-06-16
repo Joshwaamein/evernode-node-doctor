@@ -295,9 +295,20 @@ install_deps() {
     local missing=()
     local cmd
     for cmd in "${!pkg_for[@]}"; do
-        if ! command -v "$cmd" &>/dev/null; then
-            missing+=("${pkg_for[$cmd]}")
+        if command -v "$cmd" &>/dev/null; then
+            continue
         fi
+        # Don't flag docker as missing on a rootless Evernode host: it
+        # ships its own docker under /usr/bin/sashimono/dockerbin/.
+        if [ "$cmd" = "docker" ] && [ -x /usr/bin/sashimono/dockerbin/docker ]; then
+            continue
+        fi
+        # netstat is satisfied by ss (both give listening sockets); the
+        # script prefers ss everywhere, so don't demand net-tools too.
+        if [ "$cmd" = "netstat" ] && command -v ss &>/dev/null; then
+            continue
+        fi
+        missing+=("${pkg_for[$cmd]}")
     done
 
     if [ ${#missing[@]} -eq 0 ]; then
@@ -524,32 +535,56 @@ check_network_latency() {
 # Function to check SSH configuration
 check_ssh_security() {
     print_color "$YELLOW" "\n=== SSH Security Check ==="
-    
+
+    # Prefer the EFFECTIVE config from `sshd -T`, which resolves every
+    # drop-in under /etc/ssh/sshd_config.d/ (e.g. cloud-init's
+    # 50-cloud-init.conf often re-enables password auth, then a later
+    # drop-in disables it). Grepping sshd_config alone gives false
+    # positives. Fall back to grep only if sshd -T is unavailable.
     local ssh_config="/etc/ssh/sshd_config"
-    
-    if [ ! -f "$ssh_config" ]; then
-        log_error "SSH configuration file not found"
-        return 1
+    local root_login="" pass_auth="" ssh_port="" effective=0
+
+    local sshd_bin
+    sshd_bin=$(command -v sshd || echo /usr/sbin/sshd)
+    if [ -x "$sshd_bin" ]; then
+        local sshd_t
+        sshd_t=$("$sshd_bin" -T 2>/dev/null)
+        if [ -n "$sshd_t" ]; then
+            effective=1
+            root_login=$(echo "$sshd_t" | awk '/^permitrootlogin /{print $2}')
+            pass_auth=$(echo "$sshd_t" | awk '/^passwordauthentication /{print $2}')
+            ssh_port=$(echo "$sshd_t" | awk '/^port /{print $2; exit}')
+        fi
     fi
-    
-    # Check PermitRootLogin
-    root_login=$(grep -i "^PermitRootLogin" "$ssh_config" | awk '{print $2}')
-    if [ "$root_login" == "no" ] || [ "$root_login" == "prohibit-password" ]; then
+
+    if [ "$effective" -eq 0 ]; then
+        if [ ! -f "$ssh_config" ]; then
+            log_warning "SSH config not found and sshd -T unavailable; skipping SSH checks"
+            return 1
+        fi
+        log_info "Using sshd_config text (sshd -T unavailable); drop-ins not resolved"
+        root_login=$(grep -i "^PermitRootLogin" "$ssh_config" | awk '{print $2}')
+        pass_auth=$(grep -i "^PasswordAuthentication" "$ssh_config" | awk '{print $2}')
+        ssh_port=$(grep -i "^Port" "$ssh_config" | awk '{print $2}')
+    fi
+
+    # PermitRootLogin. Note: `sshd -T` prints the synonym
+    # "without-password" for what sshd_config calls "prohibit-password";
+    # both mean key-only root login (no password), which is fine.
+    if [ "$root_login" = "no" ] || [ "$root_login" = "prohibit-password" ] || [ "$root_login" = "without-password" ]; then
         log_success "Root login is properly restricted ($root_login)"
     else
-        log_warning "Root login may be enabled. Consider setting 'PermitRootLogin no'"
+        log_warning "Root login may be enabled (PermitRootLogin ${root_login:-unset}). Consider 'PermitRootLogin no'"
     fi
-    
-    # Check PasswordAuthentication
-    pass_auth=$(grep -i "^PasswordAuthentication" "$ssh_config" | awk '{print $2}')
-    if [ "$pass_auth" == "no" ]; then
+
+    # PasswordAuthentication
+    if [ "$pass_auth" = "no" ]; then
         log_success "Password authentication is disabled (key-based only)"
     else
-        log_warning "Password authentication may be enabled. Consider using key-based auth only"
+        log_warning "Password authentication is enabled (PasswordAuthentication ${pass_auth:-unset}). Consider key-based auth only"
     fi
-    
-    # Check SSH port
-    ssh_port=$(grep -i "^Port" "$ssh_config" | awk '{print $2}')
+
+    # SSH port
     if [ -n "$ssh_port" ] && [ "$ssh_port" != "22" ]; then
         log_success "SSH running on non-standard port: $ssh_port"
     else
@@ -1159,6 +1194,7 @@ analyze_port_usage() {
             echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
             
             local security_issues=0
+            local expected_idle=0
             
             for port in "${required_ports[@]}"; do
                 # Check if port is allowed in UFW
@@ -1186,10 +1222,19 @@ analyze_port_usage() {
                 # Determine status color and message
                 local status_msg=""
                 if [ "$firewall_status" == "ALLOW" ] && [ "$listening_status" == "NO" ]; then
-                    status_msg="⚠ SECURITY WARNING: Port open in firewall but nothing listening"
-                    security_issues=$((security_issues + 1))
-                    print_color "$YELLOW" "$(printf '%-8s %-12s %-12s %s' "$port" "$firewall_status" "$listening_status" "$purpose")"
-                    echo "  $status_msg"
+                    # Evernode pre-provisioned ports (user/peer/tcp/udp ranges)
+                    # are DESIGNED to be open without a bound listener until
+                    # an instance is leased. That is expected, not a security
+                    # issue. Only 80/443 idle is worth a real warning.
+                    if [ "$port" = "80" ] || [ "$port" = "443" ]; then
+                        status_msg="⚠ Open in firewall but nothing listening (check your reverse proxy)"
+                        security_issues=$((security_issues + 1))
+                        print_color "$YELLOW" "$(printf '%-8s %-12s %-12s %s' "$port" "$firewall_status" "$listening_status" "$purpose")"
+                        echo "  $status_msg"
+                    else
+                        expected_idle=$((expected_idle + 1))
+                        printf '%-8s %-12s %-12s %s [expected: binds when leased]\n' "$port" "$firewall_status" "$listening_status" "$purpose"
+                    fi
                 elif [ "$firewall_status" == "ALLOW" ] && [ "$listening_status" == "YES" ]; then
                     if [ -n "$listening_process" ]; then
                         print_color "$GREEN" "$(printf '%-8s %-12s %-12s %s (%s)' "$port" "$firewall_status" "$listening_status" "$purpose" "$listening_process")"
@@ -1222,6 +1267,9 @@ analyze_port_usage() {
             else
                 log_success "All open ports have services listening"
             fi
+            if [ "$expected_idle" -gt 0 ]; then
+                log_info "$expected_idle Evernode port(s) are open but idle. This is EXPECTED: they bind dynamically when an instance is leased, not a fault"
+            fi
         fi
     fi
 }
@@ -1242,13 +1290,21 @@ calculate_required_ports() {
 run_nmap_scan() {
     local target=$1
     local ports=$2
+
+    # nmap is optional and cannot be installed in --cron/--json mode.
+    # Its absence is informational, not a warning/failure.
+    if ! command -v nmap >/dev/null 2>&1; then
+        log_info "nmap not installed; skipping external port scan of $target (install nmap for this check)"
+        return 0
+    fi
+
     print_color "$YELLOW" "Running nmap scan on $target..."
-    
+
     if [ -z "$ports" ]; then
-        log_error "No ports provided for nmap scan"
+        log_warning "No ports provided for nmap scan"
         return 1
     fi
-    
+
     # Run nmap with proper error handling
     if ! nmap -p"$ports" -Pn "$target" 2>&1; then
         log_warning "Nmap scan failed for $target"
