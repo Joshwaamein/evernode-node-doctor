@@ -1695,6 +1695,7 @@ run_gp_probe() {
     local host=$2
     local port=$3
     local label=$4
+    local severity=${5:-hard}   # hard = fail is error; soft = fail is warning
 
     local script_dir
     script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -1724,7 +1725,13 @@ run_gp_probe() {
     case "$status" in
         pass)  log_success "$label: $detail" ;;
         skip)  log_info "$label skipped: $detail" ;;
-        *)     log_error "$label: ${detail:-probe failed}" ;;
+        *)
+            if [ "$severity" = "soft" ]; then
+                log_warning "$label: ${detail:-probe failed}. A listener is up locally, so this is likely a transient WAN/hairpin blip (peers may still reach you). Re-run to confirm; persistent failure means check port-forwarding"
+            else
+                log_error "$label: ${detail:-probe failed}"
+            fi
+            ;;
     esac
     return $rc
 }
@@ -1747,53 +1754,43 @@ check_protocol_level() {
         return 0
     fi
 
-    # Determine whether a contract instance is actually running. The
-    # HotPocket user-port listener only exists WHILE an instance/contract
-    # is running. The per-moment reputation contract is ephemeral, so a
-    # registered host with no active lease legitimately has no listener
-    # between moments. Probing then and erroring would be a false alarm.
-    local running=0
-    local db="/etc/sashimono/sa.sqlite"
-    if [ -f "$db" ]; then
-        if command -v sqlite3 >/dev/null 2>&1; then
-            running=$(sqlite3 "$db" "SELECT count(*) FROM instances WHERE status='running';" 2>/dev/null)
-        elif command -v python3 >/dev/null 2>&1; then
-            running=$(python3 - "$db" <<'PY' 2>/dev/null
-import sqlite3, sys
-try:
-    c = sqlite3.connect(sys.argv[1])
-    print(c.execute("SELECT count(*) FROM instances WHERE status='running'").fetchone()[0])
-except Exception:
-    print(0)
-PY
-)
-        fi
-    fi
-    [ -z "$running" ] && running=0
-
     # Prefer the real per-instance user_port from config over the base.
     local gp_port="$EVR_USER_PORT_BASE"
-    local cfg
+    local cfg p
     for cfg in /etc/sashimono/reputationd/reputationd.cfg \
                /etc/sashimono/mb-xrpl/mb-xrpl.cfg; do
         if [ -f "$cfg" ]; then
-            local p
             p=$(jq -r '.contractInstance.user_port // empty' "$cfg" 2>/dev/null)
-            if [ -n "$p" ]; then
-                gp_port="$p"
-                break
-            fi
+            [ -n "$p" ] && { gp_port="$p"; break; }
         fi
     done
 
-    if [ "$running" -lt 1 ]; then
-        log_info "No contract instance running, so no user-port listener is expected right now. The reputation contract is per-moment/ephemeral; this is normal for a registered host between leases. Skipping the live hairpin/GP probe"
-        echo "(Would have probed user port ${gp_port} at ${public_ip} if an instance were active.)"
+    # The HotPocket user-port listener only exists WHILE a contract
+    # instance is actually serving. A 'running' row in sa.sqlite is NOT
+    # proof of a bound socket (the reputation contract spins up/tears
+    # down per moment, and a stale row can outlive the listener). Gate on
+    # the real signal: is something actually LISTENING on the port now?
+    local listening=0
+    if command -v ss >/dev/null 2>&1; then
+        ss -tlnH 2>/dev/null | awk '{print $4}' | sed 's/.*://' | grep -qx "$gp_port" && listening=1
+    fi
+    # Cross-check with an hpws --server process bound to that port.
+    if [ "$listening" -eq 0 ] && pgrep -af "hpws .*--port ${gp_port}\b" >/dev/null 2>&1; then
+        listening=1
+    fi
+
+    if [ "$listening" -eq 0 ]; then
+        log_info "No live listener on user port ${gp_port} right now. The per-moment reputation contract is ephemeral, so this is normal between leases. Skipping the live hairpin/GP probe (not a fault)"
+        echo "(Would have probed user port ${gp_port} at ${public_ip} if a listener were up.)"
         return 0
     fi
 
     echo "Probing user port ${gp_port} at public IP ${public_ip} (WAN hairpin path)"
-    run_gp_probe "userport" "$public_ip" "$gp_port" "User-port TLS reachability (hairpin)"
+    # A listener is up locally. If the WAN hairpin probe still fails, that
+    # is usually a transient routing/hairpin blip rather than a hard host
+    # fault, so surface it as a WARNING, not an ERROR. Pass "soft" so the
+    # wrapper downgrades a userport failure.
+    run_gp_probe "userport" "$public_ip" "$gp_port" "User-port TLS reachability (hairpin)" soft
     run_gp_probe "gp" "$public_ip" "$gp_port" "GP / HotPocket peer handshake"
 }
 
